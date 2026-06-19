@@ -1,0 +1,2 @@
+cargo:rerun-if-env-changed=RUMA_IDENTIFIERS_STORAGE
+cargo:rerun-if-env-changed=RUMA_UNSTABLE_EXHAUSTIVE_TYPES

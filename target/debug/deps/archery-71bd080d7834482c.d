@@ -1,0 +1,9 @@
+/Users/krachynski/Projects/matrix/pantalaimon-rust/target/debug/deps/archery-71bd080d7834482c.d: /Users/krachynski/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/archery-1.2.2/src/lib.rs /Users/krachynski/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/archery-1.2.2/src/shared_pointer/mod.rs /Users/krachynski/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/archery-1.2.2/src/shared_pointer/kind/mod.rs /Users/krachynski/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/archery-1.2.2/src/shared_pointer/kind/arc/mod.rs /Users/krachynski/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/archery-1.2.2/src/shared_pointer/kind/rc/mod.rs
+
+/Users/krachynski/Projects/matrix/pantalaimon-rust/target/debug/deps/libarchery-71bd080d7834482c.rmeta: /Users/krachynski/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/archery-1.2.2/src/lib.rs /Users/krachynski/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/archery-1.2.2/src/shared_pointer/mod.rs /Users/krachynski/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/archery-1.2.2/src/shared_pointer/kind/mod.rs /Users/krachynski/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/archery-1.2.2/src/shared_pointer/kind/arc/mod.rs /Users/krachynski/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/archery-1.2.2/src/shared_pointer/kind/rc/mod.rs
+
+/Users/krachynski/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/archery-1.2.2/src/lib.rs:
+/Users/krachynski/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/archery-1.2.2/src/shared_pointer/mod.rs:
+/Users/krachynski/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/archery-1.2.2/src/shared_pointer/kind/mod.rs:
+/Users/krachynski/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/archery-1.2.2/src/shared_pointer/kind/arc/mod.rs:
+/Users/krachynski/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/archery-1.2.2/src/shared_pointer/kind/rc/mod.rs:

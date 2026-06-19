@@ -8,8 +8,11 @@ use axum::{
     Json,
 };
 use bytes::Bytes;
+use matrix_sdk_crypto::MediaEncryptionInfo;
 use serde::Deserialize;
 use tracing::{debug, info, warn};
+
+use crate::store::MediaInfo;
 
 use crate::{client::PanClient, error::AppError, proxy::daemon::ProxyDaemon};
 
@@ -379,24 +382,198 @@ pub async fn send_message(
 }
 
 // ---------------------------------------------------------------------------
-// Media upload  (Phase 4: encrypt before forwarding)
+// Media upload — encrypt before forwarding
 // ---------------------------------------------------------------------------
+
+#[derive(Deserialize)]
+struct UploadResponse {
+    content_uri: String,
+}
 
 pub async fn upload(
     State(daemon): State<Arc<ProxyDaemon>>,
     req: Request,
 ) -> Result<Response, AppError> {
-    daemon.forward_request(req).await
+    let token = extract_token(&req);
+
+    let (parts, body) = req.into_parts();
+    let body_bytes: Bytes =
+        axum::body::to_bytes(body, 100 * 1024 * 1024).await.map_err(|_| AppError::Body)?;
+
+    // Encrypt only for authenticated users we know about.
+    // `token_to_user` is the O(1) cache; no async call needed here.
+    let is_known = token
+        .as_deref()
+        .map(|t| daemon.is_known_token(t))
+        .unwrap_or(false);
+
+    let (upload_bytes, enc_info) = if is_known && !body_bytes.is_empty() {
+        match crate::client::PanClient::encrypt_attachment(body_bytes.clone()).await {
+            Ok((cipher, info)) => (cipher, Some(info)),
+            Err(e) => {
+                warn!("Failed to encrypt attachment: {e}");
+                (body_bytes, None)
+            }
+        }
+    } else {
+        (body_bytes, None)
+    };
+
+    // Pull filename and content-type from original request
+    let filename = parts.uri.query().and_then(|q| {
+        q.split('&').find_map(|p| p.strip_prefix("filename=").map(str::to_owned))
+    });
+    let content_type = parts
+        .headers
+        .get(http::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("application/octet-stream")
+        .to_owned();
+
+    // Forward to homeserver
+    let path = parts.uri.path_and_query().map(|pq| pq.as_str()).unwrap_or("/");
+    let base = daemon.server_conf.homeserver.as_str().trim_end_matches('/');
+    let url = format!("{base}{path}");
+
+    let mut builder = daemon.http_client.post(&url);
+    for (name, value) in &parts.headers {
+        if name != "host" && name.as_str() != "content-length" {
+            builder = builder.header(name.clone(), value.clone());
+        }
+    }
+    let upstream_resp = builder.body(upload_bytes).send().await?;
+
+    let status = upstream_resp.status();
+    let resp_headers = upstream_resp.headers().clone();
+    let resp_bytes = upstream_resp.bytes().await?;
+
+    // If we encrypted, store the keys keyed by the returned mxc URI
+    if let (Some(info), true) = (enc_info, status.is_success()) {
+        if let Ok(upload_resp) = serde_json::from_slice::<UploadResponse>(&resp_bytes) {
+            let uri = &upload_resp.content_uri; // "mxc://server/path"
+            let without_prefix = uri.trim_start_matches("mxc://");
+            if let Some(slash) = without_prefix.find('/') {
+                let mxc_server = &without_prefix[..slash];
+                let mxc_path = &without_prefix[slash + 1..];
+
+                // Serialize MediaEncryptionInfo fields to match MediaInfo storage
+                if let Ok(info_json) = serde_json::to_value(&info) {
+                    let media = MediaInfo {
+                        mxc_server: mxc_server.to_owned(),
+                        mxc_path: mxc_path.to_owned(),
+                        key: info_json["key"].clone(),
+                        iv: info_json["iv"].as_str().unwrap_or("").to_owned(),
+                        hashes: info_json["hashes"].clone(),
+                    };
+
+                    if let Err(e) = daemon.store.save_media(&daemon.name, &media).await {
+                        warn!("Failed to store media keys: {e}");
+                    } else {
+                        // Also record filename + mimetype for later retrieval
+                        if let Some(fname) = &filename {
+                            if let Err(e) = daemon
+                                .store
+                                .save_upload(&daemon.name, uri, fname, &content_type)
+                                .await
+                            {
+                                warn!("Failed to store upload info: {e}");
+                            }
+                        }
+                        debug!(%uri, "Stored media encryption keys");
+                    }
+                }
+            }
+        }
+    }
+
+    build_response(status, resp_headers, resp_bytes)
 }
 
 // ---------------------------------------------------------------------------
-// Media download  (Phase 4: decrypt after fetching)
+// Media download — decrypt after fetching
 // ---------------------------------------------------------------------------
+
+/// Extract `(server_name, media_id)` from a Matrix media download path.
+///
+/// Handles both `/_matrix/media/{ver}/download/{server}/{id}` and the
+/// `/{server}/{id}/{filename}` variant by finding the two segments that
+/// follow "download/".
+fn mxc_from_path(path: &str) -> Option<(&str, &str)> {
+    let after = path.split("/download/").nth(1)?;
+    let mut parts = after.splitn(3, '/');
+    let server = parts.next()?;
+    let media_id = parts.next()?;
+    Some((server, media_id))
+}
 
 pub async fn download(
     State(daemon): State<Arc<ProxyDaemon>>,
     req: Request,
 ) -> Result<Response, AppError> {
+    // Extract server + media_id from path without a typed Path extractor so
+    // the same handler works for both the 2- and 3-segment URL forms.
+    let (server_name, media_id) = match mxc_from_path(req.uri().path()) {
+        Some(pair) => (pair.0.to_owned(), pair.1.to_owned()),
+        None => return daemon.forward_request(req).await,
+    };
+
+    let media = daemon
+        .store
+        .load_media(&daemon.name, &server_name, &media_id)
+        .await
+        .unwrap_or(None);
+
+    if let Some(media_info) = media {
+        let enc_info_result: anyhow::Result<MediaEncryptionInfo> = (|| {
+            let info_json = serde_json::json!({
+                "v": "v2",
+                "key": media_info.key,
+                "iv": media_info.iv,
+                "hashes": media_info.hashes,
+            });
+            Ok(serde_json::from_value(info_json)?)
+        })();
+
+        match enc_info_result {
+            Ok(enc_info) => {
+                let path = req.uri().path_and_query().map(|pq| pq.as_str()).unwrap_or("/");
+                let base = daemon.server_conf.homeserver.as_str().trim_end_matches('/');
+                let url = format!("{base}{path}");
+
+                let mut builder = daemon.http_client.get(&url);
+                for (name, value) in req.headers() {
+                    if name != "host" {
+                        builder = builder.header(name.clone(), value.clone());
+                    }
+                }
+                let upstream_resp = builder.send().await?;
+                let status = upstream_resp.status();
+                let resp_headers = upstream_resp.headers().clone();
+
+                if status.is_success() {
+                    let cipher_bytes = upstream_resp.bytes().await?;
+                    match crate::client::PanClient::decrypt_attachment(cipher_bytes, enc_info).await {
+                        Ok(plaintext) => {
+                            let mut resp_builder = Response::builder().status(status.as_u16());
+                            for (name, value) in &resp_headers {
+                                if name.as_str() != "content-length" {
+                                    resp_builder =
+                                        resp_builder.header(name.as_str(), value.as_bytes());
+                                }
+                            }
+                            return Ok(resp_builder.body(Body::from(plaintext)).unwrap());
+                        }
+                        Err(e) => warn!(%server_name, %media_id, "Decrypt failed: {e}"),
+                    }
+                } else {
+                    let resp_bytes = upstream_resp.bytes().await?;
+                    return build_response(status, resp_headers, resp_bytes);
+                }
+            }
+            Err(e) => warn!(%server_name, %media_id, "Bad stored enc info: {e}"),
+        }
+    }
+
     daemon.forward_request(req).await
 }
 

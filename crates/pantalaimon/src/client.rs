@@ -5,7 +5,8 @@ use std::{collections::BTreeMap, sync::Arc};
 use anyhow::{Context, Result};
 use dashmap::DashMap;
 use matrix_sdk_crypto::{
-    DecryptionSettings, EncryptionSettings, EncryptionSyncChanges, OlmMachine, TrustRequirement,
+    AttachmentDecryptor, AttachmentEncryptor, DecryptionSettings, EncryptionSettings,
+    EncryptionSyncChanges, MediaEncryptionInfo, OlmMachine, TrustRequirement,
     types::{
         events::room::encrypted::EncryptedEvent,
         requests::{AnyIncomingResponse, AnyOutgoingRequest, ToDeviceRequest},
@@ -271,11 +272,14 @@ impl PanClient {
         &self,
         room_id: &str,
         event_type: &str,
-        content: Value,
+        mut content: Value,
     ) -> Result<(String, Value)> {
         if !self.is_room_encrypted(room_id) {
             return Ok((event_type.to_owned(), content));
         }
+
+        // Inject encryption keys for any attached media before encrypting
+        self.inject_media_keys(room_id, &mut content).await?;
 
         let ruma_room_id = RoomId::parse(room_id)?;
         let users = self.get_room_member_ids(&ruma_room_id).await?;
@@ -522,23 +526,92 @@ impl PanClient {
     }
 
     // -----------------------------------------------------------------------
-    // Phase 4 stubs — media encryption
+    // Phase 4 — media encryption
     // -----------------------------------------------------------------------
 
+    /// Encrypt raw bytes (a media upload) using AES-256-CTR.
+    ///
+    /// Returns `(ciphertext, MediaEncryptionInfo)`.  Runs in a blocking
+    /// thread so the event loop is not stalled by the I/O-bound cipher loop.
     pub async fn encrypt_attachment(
-        &self,
-        _data: bytes::Bytes,
-    ) -> Result<(bytes::Bytes, Value, String, Value)> {
-        anyhow::bail!("attachment encryption not yet implemented (Phase 4)")
+        data: bytes::Bytes,
+    ) -> Result<(bytes::Bytes, MediaEncryptionInfo)> {
+        tokio::task::spawn_blocking(move || {
+            let mut cursor = std::io::Cursor::new(data.as_ref());
+            let mut encryptor = AttachmentEncryptor::new(&mut cursor);
+            let mut ciphertext = Vec::new();
+            std::io::Read::read_to_end(&mut encryptor, &mut ciphertext)?;
+            let info = encryptor.finish();
+            Ok((bytes::Bytes::from(ciphertext), info))
+        })
+        .await?
     }
 
+    /// Decrypt a previously encrypted attachment.
+    ///
+    /// `info` must match the `MediaEncryptionInfo` produced at upload time.
+    /// Runs in a blocking thread to avoid stalling the event loop.
     pub async fn decrypt_attachment(
-        &self,
-        _data: bytes::Bytes,
-        _key: &Value,
-        _iv: &str,
-        _hashes: &Value,
+        data: bytes::Bytes,
+        info: MediaEncryptionInfo,
     ) -> Result<bytes::Bytes> {
-        anyhow::bail!("attachment decryption not yet implemented (Phase 4)")
+        tokio::task::spawn_blocking(move || {
+            let mut cursor = std::io::Cursor::new(data.as_ref());
+            let mut decryptor = AttachmentDecryptor::new(&mut cursor, info)
+                .map_err(|e| anyhow::anyhow!("AttachmentDecryptor::new: {e}"))?;
+            let mut plaintext = Vec::new();
+            std::io::Read::read_to_end(&mut decryptor, &mut plaintext)?;
+            Ok(bytes::Bytes::from(plaintext))
+        })
+        .await?
+    }
+
+    /// If `content["url"]` is an mxc URI for which we stored encryption keys,
+    /// transform the content so it uses `"file"` instead of `"url"`, ready for
+    /// embedding in an encrypted event.
+    ///
+    /// No-op if the URL is not recognised or the room is not E2E.
+    pub async fn inject_media_keys(
+        &self,
+        room_id: &str,
+        content: &mut Value,
+    ) -> Result<()> {
+        if !self.is_room_encrypted(room_id) {
+            return Ok(());
+        }
+        let url = match content.get("url").and_then(|v| v.as_str()) {
+            Some(u) if u.starts_with("mxc://") => u.to_owned(),
+            _ => return Ok(()),
+        };
+
+        // Parse mxc://server/path
+        let without_prefix = url.trim_start_matches("mxc://");
+        let slash = match without_prefix.find('/') {
+            Some(i) => i,
+            None => return Ok(()),
+        };
+        let mxc_server = &without_prefix[..slash];
+        let mxc_path = &without_prefix[slash + 1..];
+
+        let media = match self.store.load_media(&self.server_conf.name, mxc_server, mxc_path).await? {
+            Some(m) => m,
+            None => return Ok(()),
+        };
+
+        // Build the EncryptedFile object the spec expects
+        let file_obj = serde_json::json!({
+            "url": url,
+            "key": media.key,
+            "iv": media.iv,
+            "hashes": media.hashes,
+            "v": "v2"
+        });
+
+        if let Some(obj) = content.as_object_mut() {
+            obj.remove("url");
+            obj.insert("file".to_owned(), file_obj);
+        }
+
+        Ok(())
     }
 }

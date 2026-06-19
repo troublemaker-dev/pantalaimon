@@ -95,6 +95,11 @@ impl ProxyDaemon {
         self.pan_clients.insert(user_id, client);
     }
 
+    /// Return true if `token` belongs to a user we already track.
+    pub fn is_known_token(&self, token: &str) -> bool {
+        self.token_to_user.contains_key(token)
+    }
+
     #[allow(dead_code)]
     /// Find the `PanClient` that owns `token`.
     ///
