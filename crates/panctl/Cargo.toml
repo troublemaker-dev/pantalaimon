@@ -1,0 +1,18 @@
+[package]
+name = "panctl"
+version = "0.11.0"
+edition = "2021"
+description = "Control tool for pantalaimon via D-Bus"
+license = "Apache-2.0"
+
+[[bin]]
+name = "panctl"
+path = "src/main.rs"
+
+[dependencies]
+tokio = { workspace = true }
+anyhow = { workspace = true }
+clap = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+zbus = { version = "4", default-features = false, features = ["tokio"] }

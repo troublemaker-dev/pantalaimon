@@ -1,0 +1,30 @@
+[workspace]
+members = [
+    "crates/pantalaimon",
+    "crates/panctl",
+]
+resolver = "2"
+
+[workspace.dependencies]
+tokio = { version = "1", features = ["full"] }
+axum = "0.7"
+reqwest = { version = "0.12", features = ["json", "stream", "native-tls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+anyhow = "1"
+thiserror = "2"
+clap = { version = "4", features = ["derive"] }
+sqlx = { version = "0.8", features = ["sqlite", "runtime-tokio", "macros"] }
+keyring = "3"
+configparser = "3"
+dashmap = "6"
+bytes = "1"
+dirs = "5"
+futures-util = "0.3"
+http = "1"
+url = { version = "2", features = ["serde"] }
+indexmap = "2"
+matrix-sdk-crypto = "0.16.1"
+ruma = { version = "0.14", features = ["client-api-c"] }
