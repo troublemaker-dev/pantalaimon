@@ -4,3 +4,4 @@ pantalaimon.egg-info/
 .tox
 .mypy_cache
 .coverage
+/target/
