@@ -1,15 +1,19 @@
 #![allow(dead_code)]
 
-use std::{collections::BTreeMap, sync::Arc};
+use std::{collections::{BTreeMap, HashMap}, sync::Arc};
 
 use anyhow::{Context, Result};
 use dashmap::DashMap;
 use matrix_sdk_crypto::{
     AttachmentDecryptor, AttachmentEncryptor, DecryptionSettings, EncryptionSettings,
-    EncryptionSyncChanges, MediaEncryptionInfo, OlmMachine, TrustRequirement,
+    EncryptionSyncChanges, LocalTrust, MediaEncryptionInfo, OlmMachine, Sas,
+    TrustRequirement,
     types::{
         events::room::encrypted::EncryptedEvent,
-        requests::{AnyIncomingResponse, AnyOutgoingRequest, ToDeviceRequest},
+        requests::{
+            AnyIncomingResponse, AnyOutgoingRequest, OutgoingVerificationRequest,
+            RoomMessageRequest, ToDeviceRequest,
+        },
     },
 };
 use reqwest::Client as HttpClient;
@@ -19,13 +23,15 @@ use ruma::{
             claim_keys::v3::Response as KeysClaimResponse,
             get_keys::v3::Response as KeysQueryResponse,
             upload_keys::v3::Response as KeysUploadResponse,
+            upload_signatures::v3::Response as SignatureUploadResponse,
         },
+        message::send_message_event::v3::Response as RoomMessageResponse,
         sync::sync_events::DeviceLists,
         to_device::send_event_to_device::v3::Response as ToDeviceResponse,
     },
-    events::AnyToDeviceEvent,
+    events::{AnyToDeviceEvent, MessageLikeEventContent as _},
     serde::Raw,
-    OneTimeKeyAlgorithm, OwnedDeviceId, OwnedUserId, RoomId, UInt, UserId,
+    EventId, OneTimeKeyAlgorithm, OwnedDeviceId, OwnedUserId, RoomId, UInt, UserId,
 };
 use serde::Deserialize;
 use serde_json::{json, value::to_raw_value, Value};
@@ -53,7 +59,19 @@ pub struct PanClient {
     /// Rooms known to have m.room.encryption enabled (populated from sync state).
     encrypted_rooms: DashMap<String, bool>,
     ui_tx: Option<mpsc::Sender<DaemonToUi>>,
-    pan_rx: Option<tokio::sync::Mutex<mpsc::Receiver<UiToDaemon>>>,
+
+    // Phase 5 — SAS verification state
+    /// Active SAS flows keyed by "{user_id}:{device_id}".
+    active_sas: DashMap<String, Sas>,
+    /// Outgoing requests we initiated, keyed by flow_id → user_id string.
+    /// Checked each sync to call start_sas() once the remote accepts.
+    pending_requests: DashMap<String, String>,
+    /// flow_ids for which we have already emitted SasInvite.
+    notified_invite: DashMap<String, ()>,
+    /// "{user_id}:{device_id}" keys for which we have already emitted SasShow.
+    notified_show: DashMap<String, ()>,
+    /// "{user_id}:{device_id}" keys for which we have already emitted SasDone.
+    notified_done: DashMap<String, ()>,
 }
 
 impl PanClient {
@@ -65,7 +83,6 @@ impl PanClient {
         store: Arc<PanStore>,
         http_client: HttpClient,
         ui_tx: Option<mpsc::Sender<DaemonToUi>>,
-        pan_rx: Option<mpsc::Receiver<UiToDaemon>>,
     ) -> Result<Self> {
         let ruma_uid = UserId::parse(&user_id)
             .with_context(|| format!("invalid user_id {user_id:?}"))?;
@@ -82,7 +99,11 @@ impl PanClient {
             http_client,
             encrypted_rooms: DashMap::new(),
             ui_tx,
-            pan_rx: pan_rx.map(tokio::sync::Mutex::new),
+            active_sas: DashMap::new(),
+            pending_requests: DashMap::new(),
+            notified_invite: DashMap::new(),
+            notified_show: DashMap::new(),
+            notified_done: DashMap::new(),
         })
     }
 
@@ -94,7 +115,8 @@ impl PanClient {
         self.encrypted_rooms.get(room_id).map(|v| *v).unwrap_or(false)
     }
 
-    /// No background sync loop needed — the proxy intercepts sync calls.
+    /// No background loop needed — sync is intercepted by the proxy.
+    /// UI commands arrive via the shared `message_router` task in main.
     pub async fn start_sync(self: Arc<Self>) {
         debug!(user_id = %self.user_id, "PanClient ready");
     }
@@ -234,6 +256,13 @@ impl PanClient {
             }
         }
 
+        // Step 6 — detect new incoming verification requests
+        self.check_incoming_verifications(body).await;
+
+        // Step 7 — advance pending outgoing requests and active SAS flows
+        self.check_pending_requests().await;
+        self.check_sas_states().await;
+
         Ok(())
     }
 
@@ -360,8 +389,12 @@ impl PanClient {
                 AnyOutgoingRequest::ToDeviceRequest(r) => {
                     self.send_to_device(base, token, r, &id).await
                 }
-                // SignatureUpload / RoomMessage: Phase 5 (SAS verification)
-                _ => Ok(()),
+                AnyOutgoingRequest::SignatureUpload(r) => {
+                    self.send_signature_upload(base, token, r, &id).await
+                }
+                AnyOutgoingRequest::RoomMessage(r) => {
+                    self.send_room_message(base, token, r, &id).await
+                }
             };
 
             if let Err(e) = result {
@@ -613,5 +646,517 @@ impl PanClient {
         }
 
         Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    // Phase 5 — SAS device verification
+    // -----------------------------------------------------------------------
+
+    /// Send a signal to the UI layer (no-op if no channel is configured).
+    async fn emit(&self, msg: DaemonToUi) {
+        if let Some(tx) = &self.ui_tx {
+            let _ = tx.send(msg).await;
+        }
+    }
+
+    /// Dispatch a command received from the D-Bus layer.
+    pub async fn handle_ui_command(&self, cmd: UiToDaemon) {
+        let base = self.server_conf.homeserver.as_str().trim_end_matches('/');
+        let token = &self.access_token;
+
+        macro_rules! respond {
+            ($mid:expr, $code:expr, $msg:expr) => {
+                self.emit(DaemonToUi::Response {
+                    message_id: $mid,
+                    pan_user: self.user_id.clone(),
+                    code: $code.into(),
+                    message: $msg.into(),
+                })
+                .await
+            };
+        }
+
+        match cmd {
+            UiToDaemon::StartSas { message_id, user_id, device_id, .. } => {
+                match self.start_sas_for_device(base, token, &user_id, &device_id).await {
+                    Ok(()) => respond!(message_id, "M_OK", "SAS request sent"),
+                    Err(e) => respond!(message_id, "M_UNKNOWN", e.to_string()),
+                }
+            }
+            UiToDaemon::AcceptSas { message_id, user_id, device_id, .. } => {
+                match self.accept_sas_from_device(base, token, &user_id, &device_id).await {
+                    Ok(()) => respond!(message_id, "M_OK", "SAS accepted"),
+                    Err(e) => respond!(message_id, "M_UNKNOWN", e.to_string()),
+                }
+            }
+            UiToDaemon::ConfirmSas { message_id, user_id, device_id, .. } => {
+                match self.confirm_sas_with_device(base, token, &user_id, &device_id).await {
+                    Ok(()) => respond!(message_id, "M_OK", "SAS confirmed"),
+                    Err(e) => respond!(message_id, "M_UNKNOWN", e.to_string()),
+                }
+            }
+            UiToDaemon::CancelSas { message_id, user_id, device_id, .. } => {
+                match self.cancel_sas_with_device(base, token, &user_id, &device_id).await {
+                    Ok(()) => respond!(message_id, "M_OK", "SAS cancelled"),
+                    Err(e) => respond!(message_id, "M_UNKNOWN", e.to_string()),
+                }
+            }
+            UiToDaemon::VerifyDevice { message_id, user_id, device_id, .. } => {
+                match self.set_device_trust(&user_id, &device_id, LocalTrust::Verified).await {
+                    Ok(()) => respond!(message_id, "M_OK", "Device verified"),
+                    Err(e) => respond!(message_id, "M_UNKNOWN", e.to_string()),
+                }
+            }
+            UiToDaemon::UnverifyDevice { message_id, user_id, device_id, .. } => {
+                match self.set_device_trust(&user_id, &device_id, LocalTrust::Unset).await {
+                    Ok(()) => respond!(message_id, "M_OK", "Device unverified"),
+                    Err(e) => respond!(message_id, "M_UNKNOWN", e.to_string()),
+                }
+            }
+            UiToDaemon::BlacklistDevice { message_id, user_id, device_id, .. } => {
+                match self.set_device_trust(&user_id, &device_id, LocalTrust::BlackListed).await {
+                    Ok(()) => respond!(message_id, "M_OK", "Device blacklisted"),
+                    Err(e) => respond!(message_id, "M_UNKNOWN", e.to_string()),
+                }
+            }
+            UiToDaemon::UnblacklistDevice { message_id, user_id, device_id, .. } => {
+                match self.set_device_trust(&user_id, &device_id, LocalTrust::Unset).await {
+                    Ok(()) => respond!(message_id, "M_OK", "Device unblacklisted"),
+                    Err(e) => respond!(message_id, "M_UNKNOWN", e.to_string()),
+                }
+            }
+            // Key import/export and key-share decisions: Phase 7
+            UiToDaemon::ImportKeys { message_id, .. } => {
+                respond!(message_id, "M_NOT_IMPLEMENTED", "Key import: Phase 7");
+            }
+            UiToDaemon::ExportKeys { message_id, .. } => {
+                respond!(message_id, "M_NOT_IMPLEMENTED", "Key export: Phase 7");
+            }
+            UiToDaemon::ContinueKeyShare { message_id, .. } => {
+                respond!(message_id, "M_NOT_IMPLEMENTED", "Key share: Phase 7");
+            }
+            UiToDaemon::CancelKeyShare { message_id, .. } => {
+                respond!(message_id, "M_NOT_IMPLEMENTED", "Key share: Phase 7");
+            }
+            // SendAnyways / CancelSending are handled by ProxyDaemon, not PanClient
+            UiToDaemon::SendAnyways { .. } | UiToDaemon::CancelSending { .. } => {}
+        }
+    }
+
+    /// Initiate outgoing SAS verification with a specific remote device.
+    async fn start_sas_for_device(
+        &self,
+        base: &str,
+        token: &str,
+        user_id: &str,
+        device_id: &str,
+    ) -> Result<()> {
+        let uid = UserId::parse(user_id)?;
+        let did = OwnedDeviceId::from(device_id);
+        let device = self
+            .olm
+            .get_device(&uid, &did, None)
+            .await?
+            .with_context(|| format!("device {device_id} not found for {user_id}"))?;
+
+        let (verification_request, outgoing) = device.request_verification();
+        self.send_outgoing_verification(base, token, &outgoing).await;
+
+        // Record the flow_id so check_pending_requests calls start_sas when ready.
+        let flow_id = verification_request.flow_id().as_str().to_owned();
+        self.pending_requests.insert(flow_id, user_id.to_owned());
+
+        Ok(())
+    }
+
+    /// Accept an incoming SAS verification request from a remote device.
+    async fn accept_sas_from_device(
+        &self,
+        base: &str,
+        token: &str,
+        user_id: &str,
+        device_id: &str,
+    ) -> Result<()> {
+        let uid = UserId::parse(user_id)?;
+        let request = self
+            .olm
+            .get_verification_requests(&uid)
+            .into_iter()
+            .find(|r| {
+                r.other_device_id()
+                    .as_deref()
+                    .map(|d| d.as_str() == device_id)
+                    .unwrap_or(false)
+                    && !r.is_done()
+                    && !r.we_started()
+            })
+            .with_context(|| {
+                format!("no pending verification request from {user_id}:{device_id}")
+            })?;
+
+        // Sends m.key.verification.ready
+        if let Some(outgoing) = request.accept() {
+            self.send_outgoing_verification(base, token, &outgoing).await;
+        }
+
+        // Sends m.key.verification.start, gives us the Sas object
+        if let Some((sas, outgoing)) = request.start_sas().await? {
+            self.send_outgoing_verification(base, token, &outgoing).await;
+            self.active_sas
+                .insert(format!("{user_id}:{device_id}"), sas);
+        }
+
+        Ok(())
+    }
+
+    /// Confirm that the SAS emoji/decimals match (sends MAC).
+    async fn confirm_sas_with_device(
+        &self,
+        base: &str,
+        token: &str,
+        user_id: &str,
+        device_id: &str,
+    ) -> Result<()> {
+        let key = format!("{user_id}:{device_id}");
+        let sas = self
+            .active_sas
+            .get(&key)
+            .map(|e| e.clone())
+            .with_context(|| format!("no active SAS with {user_id}:{device_id}"))?;
+
+        let (requests, sig_req) = sas.confirm().await?;
+        for req in &requests {
+            self.send_outgoing_verification(base, token, req).await;
+        }
+        if let Some(sig) = sig_req {
+            let txn_id = ruma::TransactionId::new();
+            if let Err(e) = self.send_signature_upload(base, token, &sig, &txn_id).await {
+                warn!("signature upload after SAS confirm: {e}");
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Cancel an active SAS flow.
+    async fn cancel_sas_with_device(
+        &self,
+        base: &str,
+        token: &str,
+        user_id: &str,
+        device_id: &str,
+    ) -> Result<()> {
+        let key = format!("{user_id}:{device_id}");
+        if let Some((_, sas)) = self.active_sas.remove(&key) {
+            if let Some(outgoing) = sas.cancel() {
+                self.send_outgoing_verification(base, token, &outgoing).await;
+            }
+        }
+        Ok(())
+    }
+
+    /// Set the local trust level of a specific device.
+    async fn set_device_trust(
+        &self,
+        user_id: &str,
+        device_id: &str,
+        trust: LocalTrust,
+    ) -> Result<()> {
+        let uid = UserId::parse(user_id)?;
+        let did = OwnedDeviceId::from(device_id);
+        let device = self
+            .olm
+            .get_device(&uid, &did, None)
+            .await?
+            .with_context(|| format!("device {device_id} not found for {user_id}"))?;
+        device.set_local_trust(trust).await?;
+        Ok(())
+    }
+
+    /// Scan to-device events in the sync body for incoming verification requests
+    /// and emit a `SasInvite` signal for each new one.
+    async fn check_incoming_verifications(&self, body: &Value) {
+        let events = match body.pointer("/to_device/events").and_then(|v| v.as_array()) {
+            Some(e) => e.clone(),
+            None => return,
+        };
+
+        for event in &events {
+            if event.get("type").and_then(|t| t.as_str()) != Some("m.key.verification.request") {
+                continue;
+            }
+            let sender = match event.get("sender").and_then(|s| s.as_str()) {
+                Some(s) => s.to_owned(),
+                None => continue,
+            };
+            let txn_id = match event
+                .get("content")
+                .and_then(|c| c.get("transaction_id"))
+                .and_then(|t| t.as_str())
+            {
+                Some(t) => t.to_owned(),
+                None => continue,
+            };
+
+            if self.notified_invite.contains_key(&txn_id) {
+                continue;
+            }
+
+            let uid = match UserId::parse(&sender) {
+                Ok(u) => u,
+                Err(_) => continue,
+            };
+
+            if let Some(req) = self.olm.get_verification_request(&uid, &txn_id) {
+                self.notified_invite.insert(txn_id.clone(), ());
+                let device_id = req
+                    .other_device_id()
+                    .map(|d| d.to_string())
+                    .unwrap_or_default();
+                self.emit(DaemonToUi::SasInvite {
+                    pan_user: self.user_id.clone(),
+                    user_id: sender,
+                    device_id,
+                    transaction_id: txn_id,
+                })
+                .await;
+            }
+        }
+    }
+
+    /// For outgoing requests we started, call start_sas() once the remote has
+    /// accepted (request becomes ready).
+    async fn check_pending_requests(&self) {
+        let base = self.server_conf.homeserver.as_str().trim_end_matches('/');
+        let token = &self.access_token;
+        let mut to_remove = Vec::new();
+
+        for entry in self.pending_requests.iter() {
+            let flow_id = entry.key().clone();
+            let user_id_str = entry.value().clone();
+
+            let uid = match UserId::parse(&user_id_str) {
+                Ok(u) => u,
+                Err(_) => {
+                    to_remove.push(flow_id);
+                    continue;
+                }
+            };
+
+            let req = match self.olm.get_verification_request(&uid, &flow_id) {
+                Some(r) => r,
+                None => {
+                    to_remove.push(flow_id);
+                    continue;
+                }
+            };
+
+            if req.is_done() || req.is_cancelled() {
+                to_remove.push(flow_id);
+                continue;
+            }
+
+            if req.is_ready() {
+                match req.start_sas().await {
+                    Ok(Some((sas, outgoing))) => {
+                        self.send_outgoing_verification(base, token, &outgoing).await;
+                        let device_id = sas.other_device_id().to_string();
+                        self.active_sas
+                            .insert(format!("{user_id_str}:{device_id}"), sas);
+                        to_remove.push(flow_id);
+                    }
+                    Ok(None) => {} // not ready yet
+                    Err(e) => {
+                        warn!("start_sas on pending request: {e}");
+                        to_remove.push(flow_id);
+                    }
+                }
+            }
+        }
+
+        for key in to_remove {
+            self.pending_requests.remove(&key);
+        }
+    }
+
+    /// Check all active SAS flows and emit SasShow / SasDone signals as state
+    /// advances.
+    async fn check_sas_states(&self) {
+        let mut to_remove = Vec::new();
+
+        for entry in self.active_sas.iter() {
+            let key = entry.key().clone();
+            let sas = entry.value().clone();
+
+            if sas.is_cancelled() || sas.is_done() {
+                if !self.notified_done.contains_key(&key) {
+                    self.notified_done.insert(key.clone(), ());
+                    self.emit(DaemonToUi::SasDone {
+                        pan_user: self.user_id.clone(),
+                        user_id: sas.other_user_id().to_string(),
+                        device_id: sas.other_device_id().to_string(),
+                        transaction_id: sas.flow_id().as_str().to_owned(),
+                    })
+                    .await;
+                }
+                to_remove.push(key);
+                continue;
+            }
+
+            if let Some(emojis) = sas.emoji() {
+                if !self.notified_show.contains_key(&key) {
+                    self.notified_show.insert(key.clone(), ());
+                    let emoji_vec: Vec<(String, String)> = emojis
+                        .iter()
+                        .map(|e| (e.symbol.to_owned(), e.description.to_owned()))
+                        .collect();
+                    self.emit(DaemonToUi::SasShow {
+                        pan_user: self.user_id.clone(),
+                        user_id: sas.other_user_id().to_string(),
+                        device_id: sas.other_device_id().to_string(),
+                        transaction_id: sas.flow_id().as_str().to_owned(),
+                        emoji: emoji_vec,
+                    })
+                    .await;
+                }
+            }
+        }
+
+        for key in to_remove {
+            self.active_sas.remove(&key);
+            self.notified_done.remove(&key);
+        }
+    }
+
+    /// Dispatch an `OutgoingVerificationRequest` — either a to-device message
+    /// or an in-room event.
+    async fn send_outgoing_verification(
+        &self,
+        base: &str,
+        token: &str,
+        req: &OutgoingVerificationRequest,
+    ) {
+        match req {
+            OutgoingVerificationRequest::ToDevice(r) => {
+                let id = r.txn_id.clone();
+                if let Err(e) = self.send_to_device(base, token, r, &id).await {
+                    warn!("send verification to-device: {e}");
+                }
+            }
+            OutgoingVerificationRequest::InRoom(r) => {
+                let id = r.txn_id.clone();
+                if let Err(e) = self.send_room_message(base, token, r, &id).await {
+                    warn!("send verification in-room: {e}");
+                }
+            }
+        }
+    }
+
+    /// POST cross-signing signatures to the homeserver.
+    async fn send_signature_upload(
+        &self,
+        base: &str,
+        token: &str,
+        req: &ruma::api::client::keys::upload_signatures::v3::Request,
+        request_id: &ruma::TransactionId,
+    ) -> Result<()> {
+        let body = serde_json::to_value(&req.signed_keys)?;
+        self.http_client
+            .post(format!("{base}/_matrix/client/v3/keys/signatures/upload"))
+            .bearer_auth(token)
+            .json(&body)
+            .send()
+            .await?;
+
+        let ruma_resp = SignatureUploadResponse::new();
+        self.olm
+            .mark_request_as_sent(request_id, AnyIncomingResponse::SignatureUpload(&ruma_resp))
+            .await
+            .context("mark signature_upload sent")
+    }
+
+    /// PUT an in-room event (used for in-room verification messages).
+    async fn send_room_message(
+        &self,
+        base: &str,
+        token: &str,
+        req: &RoomMessageRequest,
+        request_id: &ruma::TransactionId,
+    ) -> Result<()> {
+        let event_type = req.content.event_type();
+        let txn_id = req.txn_id.as_str();
+        let room_id = &req.room_id;
+        let body = serde_json::to_value(&*req.content)?;
+
+        let resp: Value = self
+            .http_client
+            .put(format!(
+                "{base}/_matrix/client/v3/rooms/{room_id}/send/{event_type}/{txn_id}"
+            ))
+            .bearer_auth(token)
+            .json(&body)
+            .send()
+            .await?
+            .json()
+            .await?;
+
+        let event_id = resp
+            .get("event_id")
+            .and_then(|v| v.as_str())
+            .and_then(|s| EventId::parse(s).ok())
+            .unwrap_or_else(|| EventId::parse("$placeholder:placeholder.invalid").unwrap());
+
+        let ruma_resp = RoomMessageResponse::new(event_id);
+        self.olm
+            .mark_request_as_sent(request_id, AnyIncomingResponse::RoomMessage(&ruma_resp))
+            .await
+            .context("mark room_message sent")
+    }
+
+    // -----------------------------------------------------------------------
+    // Device listing (for D-Bus queries)
+    // -----------------------------------------------------------------------
+
+    pub async fn list_user_devices(&self, user_id: &str) -> Vec<HashMap<String, String>> {
+        let uid = match UserId::parse(user_id) {
+            Ok(u) => u,
+            Err(_) => return Vec::new(),
+        };
+        match self.olm.get_user_devices(&uid, None).await {
+            Ok(devices) => devices
+                .devices()
+                .map(|d| {
+                    let trust_state = match d.local_trust_state() {
+                        LocalTrust::Verified => "verified",
+                        LocalTrust::BlackListed => "blacklisted",
+                        LocalTrust::Ignored => "ignored",
+                        LocalTrust::Unset => "unset",
+                    };
+                    HashMap::from([
+                        ("user_id".into(), d.user_id().to_string()),
+                        ("device_id".into(), d.device_id().to_string()),
+                        (
+                            "device_display_name".into(),
+                            d.display_name().unwrap_or("").to_owned(),
+                        ),
+                        (
+                            "ed25519".into(),
+                            d.ed25519_key()
+                                .map(|k| k.to_base64())
+                                .unwrap_or_default(),
+                        ),
+                        ("trust_state".into(), trust_state.to_owned()),
+                    ])
+                })
+                .collect(),
+            Err(_) => Vec::new(),
+        }
+    }
+
+    /// Returns all devices the OlmMachine knows about across all tracked users.
+    /// OlmMachine has no list-all-users API; callers should iterate per-user
+    /// via `list_user_devices` or derive from the pan_users set.
+    pub fn list_all_devices(&self) -> Vec<HashMap<String, String>> {
+        Vec::new()
     }
 }

@@ -8,6 +8,9 @@ PANCTL(1) - General Commands Manual
 
 **panctl**
 is a small utility to control and introspect the state of pantalaimon.
+It communicates with the running daemon over D-Bus
+(bus name
+**org.pantalaimon1**).
 
 ## Commands
 
@@ -17,74 +20,81 @@ are as follows:
 
 **list-servers**
 
-> List the configured homeservers and pan users on each homeserver.
+> List the configured homeserver proxies.
+
+**list-users**
+
+> List all users that currently have an active pan session.
 
 **list-devices** *pan-user* *user-id*
 
-> List the devices of a user that are known to the
-> *pan-user*.
+> List the devices of *user-id* that are known to the given *pan-user*.
 
-**start-verification** *pan-user* *user-id*
+**start-verification** *pan-user* *user-id* *device-id*
 
-> Start an interactive key verification between the given pan-user and user.
+> Start an interactive SAS (short authentication string) key verification
+> between the given *pan-user* and the remote *device-id*.
+> The daemon will emit a
+> **SasShow**
+> signal when the emoji codes are ready to compare.
 
-**accept-verification** *pan-user* *user-id*
+**accept-verification** *pan-user* *user-id* *device-id*
 
-> Accept an interactive key verification that the given user has started with our
-> given pan-user.
+> Accept an interactive key verification that the remote device has started.
 
-**cancel-verification** *pan-user* *user-id*
+**confirm-verification** *pan-user* *user-id* *device-id*
 
-> Cancel an interactive key verification between the given pan-user and user.
+> Confirm that the short authentication string shown on both devices matches.
 
-**confirm-verification** *pan-user* *user-id*
+**cancel-verification** *pan-user* *user-id* *device-id*
 
-> Confirm that the short authentication string of the interactive key verification
-> with the given pan-user and user is matching.
+> Cancel an in-progress interactive key verification.
 
 **verify-device** *pan-user* *user-id* *device-id*
 
-> Manually mark the given device as verified. The device will be marked as verified
-> only for the given pan-user.
+> Manually mark the given device as verified for the given *pan-user*.
 
 **unverify-device** *pan-user* *user-id* *device-id*
 
-> Mark a previously verified device of the given user as unverified.
+> Remove the verified mark from a previously verified device.
 
 **blacklist-device** *pan-user* *user-id* *device-id*
 
-> Manually mark the given device of the given user as blacklisted.
+> Mark the given device as blacklisted.
+> Blacklisted devices never receive encryption keys.
 
 **unblacklist-device** *pan-user* *user-id* *device-id*
 
-> Mark a previously blacklisted device of the given user as unblacklisted.
+> Remove the blacklisted mark from a previously blacklisted device.
 
 **send-anyways** *pan-user* *room-id*
 
-> If a encrypted room contains unverified devices and a connected Matrix client
-> tries to send an message to such a room
-> **pantalaimon**
-> will send a notification that the room contains unverified users. Using this
-> command the user can choose to mark all unverified devices as ignored. Ignored
-> devices will receive encryption keys but will be left marked as unverified.
-> The message will be sent away after all devices are marked as ignored.
+> When pantalaimon blocks a message because an encrypted room contains
+> unverified devices, this command instructs the daemon to mark all
+> unverified devices as ignored and send the message.
 
 **cancel-sending** *pan-user* *room-id*
 
-> In contrast to the
-> **send-anyways**
-> command this command cancels the sending of a message to an encrypted room with
-> unverified devices and gives the user the opportunity to verify or blacklist
-> devices as they see fit.
+> Cancel a message that pantalaimon has blocked due to unverified devices.
+> The user can then verify or blacklist devices before retrying.
 
 **import-keys** *pan-user* *file* *passphrase*
 
-> Import end-to-end encryption keys from the given file for the given pan-user.
+> Import end-to-end encryption keys from the given file for the given
+> *pan-user*.
 
 **export-keys** *pan-user* *file* *passphrase*
 
-> Export end-to-end encryption keys to the given file for the given pan-user. The
-> provided passphrase is used to encrypt the file containing the keys.
+> Export end-to-end encryption keys to the given file.
+> The provided passphrase is used to encrypt the exported file.
+
+**continue-keyshare** *pan-user* *user-id* *device-id*
+
+> Forward a pending Megolm key-share request from the given device.
+
+**cancel-keyshare** *pan-user* *user-id* *device-id*
+
+> Reject a pending Megolm key-share request from the given device.
 
 # EXIT STATUS
 
@@ -98,7 +108,6 @@ pantalaimon(5)
 # AUTHORS
 
 **panctl**
-was written by
+was originally written by
 Damir Jeli&#263; &lt;[poljar@termina.org.uk](mailto:poljar@termina.org.uk)&gt;.
-
-Linux 5.1.3-arch2-1-ARCH - May 23, 2019
+Rewritten in Rust by the pantalaimon contributors.

@@ -64,12 +64,28 @@ impl PanStore {
 
         let store = Self { pool };
         store.create_tables().await?;
+        let ver = store.schema_version().await.unwrap_or(0);
+        debug!("pan.db schema version {ver}");
         Ok(store)
+    }
+
+    pub async fn schema_version(&self) -> Result<i64> {
+        sqlx::query_scalar("SELECT version FROM schema_version LIMIT 1")
+            .fetch_one(&self.pool)
+            .await
+            .map_err(Into::into)
     }
 
     async fn create_tables(&self) -> Result<()> {
         sqlx::query(
             r#"
+            CREATE TABLE IF NOT EXISTS schema_version (
+                version INTEGER NOT NULL
+            );
+            -- Insert version 1 only on first creation; no-op on subsequent starts.
+            INSERT INTO schema_version (version)
+            SELECT 1 WHERE NOT EXISTS (SELECT 1 FROM schema_version);
+
             CREATE TABLE IF NOT EXISTS servers (
                 id   INTEGER PRIMARY KEY AUTOINCREMENT,
                 name TEXT    NOT NULL UNIQUE

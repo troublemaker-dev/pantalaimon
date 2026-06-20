@@ -27,12 +27,14 @@ calls to register itself to the daemon, such a registered user is called a pan
 user and will have its own sync loop to keep up with the server. Multiple matrix
 clients can connect and use the same pan user.
 
-If user interaction is required
 **pantalaimon**
-will send out OS notifications which the user can react to.
-**pantalaimon**
-also provides a D-Bus API that is used for encryption related tasks that
-require user interference (e.g. device verification).
+provides a D-Bus API (bus name
+**org.pantalaimon1**)
+that is used for encryption-related tasks requiring user interaction,
+such as device verification.
+The companion utility
+panctl(1)
+exposes these operations on the command line.
 
 **pantalaimon**
 requires a homeserver to be configured. Multiple homeservers can be configured,
@@ -109,7 +111,6 @@ pantalaimon(5)
 # AUTHORS
 
 **pantalaimon**
-was written by
+was originally written by
 Damir Jeli&#263; &lt;[poljar@termina.org.uk](mailto:poljar@termina.org.uk)&gt;.
-
-Linux 5.3.5-arch1-1-ARCH - October 18, 2019
+Rewritten in Rust by the pantalaimon contributors.

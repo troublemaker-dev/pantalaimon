@@ -151,3 +151,25 @@ pub enum UiToDaemon {
         device_id: String,
     },
 }
+
+impl UiToDaemon {
+    /// Extract the `pan_user` field present in every variant.
+    pub fn pan_user(&self) -> &str {
+        match self {
+            UiToDaemon::SendAnyways { pan_user, .. }
+            | UiToDaemon::CancelSending { pan_user, .. }
+            | UiToDaemon::VerifyDevice { pan_user, .. }
+            | UiToDaemon::UnverifyDevice { pan_user, .. }
+            | UiToDaemon::BlacklistDevice { pan_user, .. }
+            | UiToDaemon::UnblacklistDevice { pan_user, .. }
+            | UiToDaemon::ImportKeys { pan_user, .. }
+            | UiToDaemon::ExportKeys { pan_user, .. }
+            | UiToDaemon::StartSas { pan_user, .. }
+            | UiToDaemon::CancelSas { pan_user, .. }
+            | UiToDaemon::ConfirmSas { pan_user, .. }
+            | UiToDaemon::AcceptSas { pan_user, .. }
+            | UiToDaemon::ContinueKeyShare { pan_user, .. }
+            | UiToDaemon::CancelKeyShare { pan_user, .. } => pan_user,
+        }
+    }
+}

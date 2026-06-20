@@ -1,7 +1,9 @@
-use std::{collections::HashMap, path::PathBuf, sync::Arc};
+use std::{path::PathBuf, sync::Arc};
 
 use anyhow::{Context, Result};
 use clap::{Parser, ValueEnum};
+use dashmap::DashMap;
+use tokio::sync::mpsc;
 use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 
@@ -15,6 +17,7 @@ mod store;
 
 use client::PanClient;
 use config::read_config;
+use messages::{DaemonToUi, UiToDaemon};
 use proxy::{
     daemon::ProxyDaemon,
     routes::{load_from_keyring, save_to_keyring},
@@ -116,49 +119,43 @@ async fn main() -> Result<()> {
     // Shared SQLite store
     let store = Arc::new(PanStore::new(&data_dir).await?);
 
-    // Build one ProxyDaemon per configured server so startup restore has
-    // access to the daemon's register_client method.
-    let mut daemons: HashMap<String, Arc<ProxyDaemon>> = HashMap::new();
+    // Channels: daemon → D-Bus signals, D-Bus commands → daemon.
+    let (ui_tx, ui_rx) = mpsc::channel::<DaemonToUi>(256);
+    let (pan_tx, pan_rx) = mpsc::channel::<UiToDaemon>(256);
+
+    // Build one ProxyDaemon per configured server.
+    let daemons: Arc<DashMap<String, Arc<ProxyDaemon>>> = Arc::new(DashMap::new());
 
     for (server_name, server_conf) in &pan_conf.servers {
         let daemon =
-            ProxyDaemon::new(server_conf.clone(), store.clone()).await?;
+            ProxyDaemon::new(server_conf.clone(), store.clone(), Some(ui_tx.clone())).await?;
         daemons.insert(server_name.clone(), daemon);
     }
 
-    // Restore PanClients for every user that was logged in during a previous
-    // run.  Token precedence: keyring > database.
+    // Restore PanClients for every user that was logged in during a previous run.
     for (server_name, server_conf) in &pan_conf.servers {
         let sessions = store.load_session_tokens(server_name).await?;
 
         for (user_id, device_id, db_token) in sessions {
-            // Keyring takes precedence (the user may have logged in again
-            // since we last ran and the new token is in the keyring).
             let token = if server_conf.use_keyring {
-                load_from_keyring(&user_id, &device_id)
-                    .unwrap_or(db_token.clone())
+                load_from_keyring(&user_id, &device_id).unwrap_or(db_token.clone())
             } else {
                 db_token.clone()
             };
 
-            // If keyring held a different token, update the DB.
             if server_conf.use_keyring && token != db_token {
-                if let Err(e) = store
-                    .save_access_token(&user_id, &device_id, &token)
-                    .await
-                {
+                if let Err(e) = store.save_access_token(&user_id, &device_id, &token).await {
                     warn!(%user_id, "Failed to refresh DB token from keyring: {e}");
                 }
             }
 
-            // Ensure the keyring always has an entry (idempotent).
             if server_conf.use_keyring {
                 save_to_keyring(&user_id, &device_id, &token);
             }
 
             info!(%user_id, %device_id, server = %server_name, "Restored session");
 
-            let daemon = daemons.get(server_name).unwrap();
+            let daemon = daemons.get(server_name).unwrap().clone();
             let client = match PanClient::new(
                 user_id,
                 device_id,
@@ -166,8 +163,7 @@ async fn main() -> Result<()> {
                 server_conf.clone(),
                 store.clone(),
                 daemon.http_client.clone(),
-                None, // ui_tx — wired in Phase 6
-                None, // pan_rx — wired in Phase 6
+                Some(ui_tx.clone()),
             )
             .await
             {
@@ -183,14 +179,34 @@ async fn main() -> Result<()> {
         }
     }
 
-    // D-Bus server (Phase 6: replaces the no-op stub)
-    tokio::spawn(dbus::server::DbusServer::new().run());
+    // Message router: dispatches D-Bus commands to the right PanClient.
+    let daemons_for_router = daemons.clone();
+    tokio::spawn(async move {
+        let mut rx = pan_rx;
+        while let Some(cmd) = rx.recv().await {
+            let user = cmd.pan_user().to_owned();
+            let mut found = false;
+            for daemon in daemons_for_router.iter() {
+                if let Some(client) = daemon.pan_clients.get(&user) {
+                    client.handle_ui_command(cmd.clone()).await;
+                    found = true;
+                    break;
+                }
+            }
+            if !found {
+                warn!(user_id = %user, "message_router: no PanClient for user");
+            }
+        }
+    });
+
+    // D-Bus server.
+    tokio::spawn(dbus::server::DbusServer::new(pan_tx, ui_rx, daemons.clone()).run());
 
     // Start one axum server per configured homeserver.
     let mut handles = Vec::new();
 
     for (server_name, server_conf) in pan_conf.servers {
-        let daemon = daemons.remove(&server_name).unwrap();
+        let daemon = daemons.get(&server_name).unwrap().clone();
         info!(
             server = %server_conf.name,
             listen = %format!("{}:{}", server_conf.listen_address, server_conf.listen_port),
@@ -203,7 +219,6 @@ async fn main() -> Result<()> {
 
     println!("pantalaimon running — press Ctrl+C to stop");
 
-    // Wait for a shutdown signal.
     #[cfg(unix)]
     {
         use tokio::signal::unix::{signal, SignalKind};

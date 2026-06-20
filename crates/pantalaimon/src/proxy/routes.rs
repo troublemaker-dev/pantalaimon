@@ -133,8 +133,7 @@ pub async fn login(
                     daemon.server_conf.clone(),
                     daemon.store.clone(),
                     daemon.http_client.clone(),
-                    None,
-                    None,
+                    daemon.ui_tx.clone(),
                 )
                 .await
                 {

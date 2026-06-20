@@ -9,10 +9,13 @@ use reqwest::Client;
 use serde::Deserialize;
 use tracing::{debug, warn};
 
+use tokio::sync::mpsc;
+
 use crate::{
     client::PanClient,
     config::ServerConfig,
     error::AppError,
+    messages::DaemonToUi,
     store::PanStore,
 };
 
@@ -40,6 +43,8 @@ pub struct ProxyDaemon {
     pub server_conf: ServerConfig,
     pub store: Arc<PanStore>,
     pub http_client: Client,
+    /// Channel to forward daemon→UI signals from freshly-created PanClients.
+    pub ui_tx: Option<mpsc::Sender<DaemonToUi>>,
 
     /// user_id → PanClient.  One client per logged-in user.
     pub pan_clients: DashMap<String, Arc<PanClient>>,
@@ -50,7 +55,11 @@ pub struct ProxyDaemon {
 }
 
 impl ProxyDaemon {
-    pub async fn new(server_conf: ServerConfig, store: Arc<PanStore>) -> Result<Arc<Self>> {
+    pub async fn new(
+        server_conf: ServerConfig,
+        store: Arc<PanStore>,
+        ui_tx: Option<mpsc::Sender<DaemonToUi>>,
+    ) -> Result<Arc<Self>> {
         let mut client_builder = Client::builder();
 
         if let Some(proxy_url) = &server_conf.proxy {
@@ -69,6 +78,7 @@ impl ProxyDaemon {
             server_conf,
             store,
             http_client,
+            ui_tx,
             pan_clients: DashMap::new(),
             token_to_user: DashMap::new(),
         }))
