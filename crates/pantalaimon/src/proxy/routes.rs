@@ -196,7 +196,7 @@ pub async fn sync(
                     } else if let Ok(patched) = serde_json::to_vec(&body_json) {
                         let mut resp_builder = Response::builder().status(status.as_u16());
                         for (name, value) in &resp_headers {
-                            if name.as_str() != "content-length" {
+                            if !should_strip_response_header(name.as_str()) {
                                 resp_builder = resp_builder.header(name.as_str(), value.as_bytes());
                             }
                         }
@@ -645,6 +645,28 @@ pub async fn proxy_pass(
 // Helper
 // ---------------------------------------------------------------------------
 
+/// Returns true for headers that must not be forwarded to downstream clients.
+///
+/// Hop-by-hop headers are framing concerns handled by hyper/reqwest.
+/// content-encoding and content-length are stripped because reqwest
+/// transparently decompresses response bodies, leaving the original
+/// headers stale and mismatched.
+fn should_strip_response_header(name: &str) -> bool {
+    matches!(
+        name,
+        "connection"
+            | "keep-alive"
+            | "proxy-authenticate"
+            | "proxy-authorization"
+            | "te"
+            | "trailers"
+            | "transfer-encoding"
+            | "upgrade"
+            | "content-encoding"
+            | "content-length"
+    )
+}
+
 fn build_response(
     status: reqwest::StatusCode,
     headers: reqwest::header::HeaderMap,
@@ -655,7 +677,9 @@ fn build_response(
 
     let mut builder = Response::builder().status(axum_status);
     for (name, value) in &headers {
-        builder = builder.header(name.as_str(), value.as_bytes());
+        if !should_strip_response_header(name.as_str()) {
+            builder = builder.header(name.as_str(), value.as_bytes());
+        }
     }
     Ok(builder.body(Body::from(body)).unwrap())
 }
