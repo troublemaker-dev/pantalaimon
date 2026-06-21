@@ -163,6 +163,22 @@ pub async fn sync(
     let token = extract_token(&req);
     let t0 = std::time::Instant::now();
 
+    // Initial sync (no `since` param) requests full state and can take a long
+    // time on the homeserver side.  We have no Megolm sessions yet so there
+    // is nothing to decrypt, and receive_sync_changes can happen in the
+    // background.  Proxy-pass it directly to avoid buffering a large body and
+    // racing against the client's timeout.
+    let is_initial_sync = req
+        .uri()
+        .query()
+        .map(|q| !q.split('&').any(|kv| kv.starts_with("since=")))
+        .unwrap_or(true);
+
+    if is_initial_sync {
+        debug!("initial sync — proxy-passing without processing");
+        return daemon.forward_request(req).await;
+    }
+
     // Forward the sync request to the homeserver.
     let (parts, body) = req.into_parts();
     let body_bytes: Bytes =
