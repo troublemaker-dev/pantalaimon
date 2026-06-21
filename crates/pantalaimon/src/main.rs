@@ -94,11 +94,9 @@ async fn main() -> Result<()> {
         .map(tracing::Level::from)
         .unwrap_or(pan_conf.log_level);
 
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::from_default_env().add_directive(level.into()),
-        )
-        .init();
+    let filter = EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| EnvFilter::new(level.to_string()));
+    tracing_subscriber::fmt().with_env_filter(filter).init();
 
     if pan_conf.servers.is_empty() {
         anyhow::bail!(

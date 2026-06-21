@@ -13,9 +13,9 @@ use self::{daemon::ProxyDaemon, routes::*};
 /// Build the axum `Router` with all Matrix proxy routes.
 pub fn build_router(daemon: Arc<ProxyDaemon>) -> Router {
     Router::new()
-        // Login
-        .route("/_matrix/client/r0/login", post(login))
-        .route("/_matrix/client/v3/login", post(login))
+        // Login — GET returns available flows (proxy through); POST is intercepted
+        .route("/_matrix/client/r0/login", get(proxy_pass).post(login))
+        .route("/_matrix/client/v3/login", get(proxy_pass).post(login))
         // Sync
         .route("/_matrix/client/r0/sync", get(sync))
         .route("/_matrix/client/v3/sync", get(sync))
@@ -70,14 +70,14 @@ pub fn build_router(daemon: Arc<ProxyDaemon>) -> Router {
         // Media upload
         .route("/_matrix/media/r0/upload", post(upload))
         .route("/_matrix/media/v3/upload", post(upload))
-        // Profile
+        // Profile — PUT sets avatar (intercepted for media key injection); GET proxies through
         .route(
             "/_matrix/client/r0/profile/:user_id/avatar_url",
-            put(profile),
+            get(proxy_pass).put(profile),
         )
         .route(
             "/_matrix/client/v3/profile/:user_id/avatar_url",
-            put(profile),
+            get(proxy_pass).put(profile),
         )
         // Catch-all
         .fallback(proxy_pass)
