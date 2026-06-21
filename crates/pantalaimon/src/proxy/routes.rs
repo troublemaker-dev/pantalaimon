@@ -194,6 +194,11 @@ pub async fn sync(
                     if let Err(e) = client.process_sync(&mut body_json).await {
                         warn!("process_sync error: {e}");
                     } else if let Ok(patched) = serde_json::to_vec(&body_json) {
+                        // Flush outgoing crypto requests after returning the
+                        // response so the client isn't blocked on key
+                        // upload/query round-trips.
+                        tokio::spawn(client.clone().run_post_sync_tasks());
+
                         let mut resp_builder = Response::builder().status(status.as_u16());
                         for (name, value) in &resp_headers {
                             if !should_strip_response_header(name.as_str()) {

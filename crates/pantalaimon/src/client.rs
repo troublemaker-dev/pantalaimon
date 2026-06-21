@@ -175,8 +175,8 @@ impl PanClient {
             warn!("OlmMachine receive_sync_changes: {e}");
         }
 
-        // Step 3 — flush outgoing crypto requests
-        self.process_outgoing_requests().await;
+        // Step 3 — outgoing crypto requests are flushed after the response is
+        // returned (see run_post_sync_tasks), so skip them here.
 
         // Step 4 — track encryption-enabled rooms
         if let Some(join) = body.pointer("/rooms/join").and_then(|r| r.as_object()) {
@@ -259,9 +259,8 @@ impl PanClient {
         // Step 6 — detect new incoming verification requests
         self.check_incoming_verifications(body).await;
 
-        // Step 7 — advance pending outgoing requests and active SAS flows
-        self.check_pending_requests().await;
-        self.check_sas_states().await;
+        // Steps 6-7 (check_pending_requests, check_sas_states) are also
+        // deferred to run_post_sync_tasks.
 
         Ok(())
     }
@@ -359,10 +358,23 @@ impl PanClient {
     }
 
     // -----------------------------------------------------------------------
+    // Post-sync background work
+    // -----------------------------------------------------------------------
+
+    /// Flush outgoing crypto requests and advance verification flows.
+    /// Called from the sync handler in a spawned task so the sync response
+    /// is returned to the client before any homeserver round-trips happen.
+    pub async fn run_post_sync_tasks(self: std::sync::Arc<Self>) {
+        self.process_outgoing_requests().await;
+        self.check_pending_requests().await;
+        self.check_sas_states().await;
+    }
+
+    // -----------------------------------------------------------------------
     // Outgoing crypto request pump
     // -----------------------------------------------------------------------
 
-    async fn process_outgoing_requests(&self) {
+    pub async fn process_outgoing_requests(&self) {
         let requests = match self.olm.outgoing_requests().await {
             Ok(r) => r,
             Err(e) => {
@@ -926,7 +938,7 @@ impl PanClient {
 
     /// For outgoing requests we started, call start_sas() once the remote has
     /// accepted (request becomes ready).
-    async fn check_pending_requests(&self) {
+    pub async fn check_pending_requests(&self) {
         let base = self.server_conf.homeserver.as_str().trim_end_matches('/');
         let token = &self.access_token;
         let mut to_remove = Vec::new();
@@ -981,7 +993,7 @@ impl PanClient {
 
     /// Check all active SAS flows and emit SasShow / SasDone signals as state
     /// advances.
-    async fn check_sas_states(&self) {
+    pub async fn check_sas_states(&self) {
         let mut to_remove = Vec::new();
 
         for entry in self.active_sas.iter() {
