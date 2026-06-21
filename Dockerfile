@@ -17,7 +17,9 @@ COPY Cargo.toml Cargo.lock ./
 COPY crates/ crates/
 
 # Build both binaries in release mode with the D-Bus UI enabled.
-RUN cargo build --release --features ui \
+# Limit parallelism to reduce peak memory usage during ruma/matrix-sdk codegen.
+RUN JOBS=$(( $(nproc) > 2 ? $(nproc) - 2 : 1 )) \
+    && cargo build --release --features ui -j${JOBS} \
     && strip target/release/pantalaimon target/release/panctl
 
 # ---- runtime stage ----
