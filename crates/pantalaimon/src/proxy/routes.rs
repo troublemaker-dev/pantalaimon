@@ -337,7 +337,7 @@ pub async fn send_message(
     // Try to encrypt if we have a client for this token
     if let Some(tok) = token {
         if let Some(client) = daemon.resolve_client(&tok).await {
-            if client.is_room_encrypted(&room_id) {
+            if client.fetch_room_encryption(&room_id).await {
                 match serde_json::from_slice::<serde_json::Value>(&body_bytes) {
                     Ok(content) => {
                         match client.prepare_and_encrypt(&room_id, &event_type, content).await {
@@ -366,10 +366,17 @@ pub async fn send_message(
                                     .trim_end_matches('/');
                                 let url = format!("{base}{path}{qs}");
 
+                                debug!(
+                                    %room_id,
+                                    body_len = encrypted_bytes.len(),
+                                    preview = %String::from_utf8_lossy(&encrypted_bytes[..encrypted_bytes.len().min(120)]),
+                                    "sending encrypted event to homeserver"
+                                );
                                 let mut builder =
                                     daemon.http_client.put(&url);
                                 for (name, value) in &parts.headers {
-                                    if name != "host" && name.as_str() != "connection" {
+                                    let n = name.as_str();
+                                    if n != "host" && n != "connection" && n != "content-length" {
                                         builder = builder.header(name.clone(), value.clone());
                                     }
                                 }
@@ -378,6 +385,9 @@ pub async fn send_message(
                                 let status = upstream_resp.status();
                                 let resp_headers = upstream_resp.headers().clone();
                                 let resp_bytes = upstream_resp.bytes().await?;
+                                if !status.is_success() {
+                                    warn!(%room_id, %status, body = %String::from_utf8_lossy(&resp_bytes), "homeserver rejected encrypted send");
+                                }
                                 return build_response(status, resp_headers, resp_bytes);
                             }
                             Err(e) => warn!(%room_id, "Encryption failed, sending plaintext: {e}"),
@@ -390,6 +400,13 @@ pub async fn send_message(
     }
 
     // Fallback: forward as-is
+    debug!(
+        %room_id,
+        encrypted = false,
+        body_len = body_bytes.len(),
+        preview = %String::from_utf8_lossy(&body_bytes[..body_bytes.len().min(120)]),
+        "forwarding plaintext event to homeserver"
+    );
     let path = parts.uri.path_and_query().map(|pq| pq.as_str()).unwrap_or("/");
     let base = daemon.server_conf.homeserver.as_str().trim_end_matches('/');
     let url = format!("{base}{path}");
@@ -404,6 +421,9 @@ pub async fn send_message(
     let status = upstream_resp.status();
     let resp_headers = upstream_resp.headers().clone();
     let resp_bytes = upstream_resp.bytes().await?;
+    if !status.is_success() {
+        warn!(%room_id, %status, body = %String::from_utf8_lossy(&resp_bytes), "homeserver rejected send");
+    }
     build_response(status, resp_headers, resp_bytes)
 }
 

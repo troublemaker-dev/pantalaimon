@@ -115,6 +115,29 @@ impl PanClient {
         self.encrypted_rooms.get(room_id).map(|v| *v).unwrap_or(false)
     }
 
+    /// Check if a room has encryption enabled, lazily fetching state from the
+    /// homeserver on first access and caching the result.
+    pub async fn fetch_room_encryption(&self, room_id: &str) -> bool {
+        if let Some(v) = self.encrypted_rooms.get(room_id) {
+            return *v;
+        }
+        let base = self.server_conf.homeserver.as_str().trim_end_matches('/');
+        let url = format!(
+            "{base}/_matrix/client/v3/rooms/{room_id}/state/m.room.encryption"
+        );
+        let encrypted = self
+            .http_client
+            .get(&url)
+            .bearer_auth(&self.access_token)
+            .send()
+            .await
+            .map(|r| r.status().is_success())
+            .unwrap_or(false);
+        debug!(%room_id, encrypted, "fetched room encryption state from homeserver");
+        self.encrypted_rooms.insert(room_id.to_owned(), encrypted);
+        encrypted
+    }
+
     /// No background loop needed — sync is intercepted by the proxy.
     /// UI commands arrive via the shared `message_router` task in main.
     pub async fn start_sync(self: Arc<Self>) {
