@@ -161,6 +161,7 @@ pub async fn sync(
     req: Request,
 ) -> Result<Response, AppError> {
     let token = extract_token(&req);
+    let t0 = std::time::Instant::now();
 
     // Forward the sync request to the homeserver.
     let (parts, body) = req.into_parts();
@@ -185,29 +186,34 @@ pub async fn sync(
     let status = upstream_resp.status();
     let resp_headers = upstream_resp.headers().clone();
     let resp_bytes = upstream_resp.bytes().await?;
+    debug!(elapsed_ms = t0.elapsed().as_millis(), body_bytes = resp_bytes.len(), "homeserver sync response received");
 
     if status.is_success() {
         if let Some(tok) = token {
             if let Some(client) = daemon.resolve_client(&tok).await {
+                let t_parse = std::time::Instant::now();
                 if let Ok(mut body_json) = serde_json::from_slice::<serde_json::Value>(&resp_bytes)
                 {
+                    debug!(elapsed_ms = t_parse.elapsed().as_millis(), "json parse");
+                    let t_process = std::time::Instant::now();
                     if let Err(e) = client.process_sync(&mut body_json).await {
                         warn!("process_sync error: {e}");
-                    } else if let Ok(patched) = serde_json::to_vec(&body_json) {
-                        // Flush outgoing crypto requests after returning the
-                        // response so the client isn't blocked on key
-                        // upload/query round-trips.
+                    } else if let Ok(patched) = {
+                        debug!(elapsed_ms = t_process.elapsed().as_millis(), "process_sync");
+                        let t_ser = std::time::Instant::now();
+                        let v = serde_json::to_vec(&body_json);
+                        debug!(elapsed_ms = t_ser.elapsed().as_millis(), "json serialize");
+                        v
+                    } {
                         tokio::spawn(client.clone().run_post_sync_tasks());
-
                         let mut resp_builder = Response::builder().status(status.as_u16());
                         for (name, value) in &resp_headers {
                             if !should_strip_response_header(name.as_str()) {
                                 resp_builder = resp_builder.header(name.as_str(), value.as_bytes());
                             }
                         }
-                        return Ok(resp_builder
-                            .body(Body::from(patched))
-                            .unwrap());
+                        debug!(total_ms = t0.elapsed().as_millis(), "sync response dispatched");
+                        return Ok(resp_builder.body(Body::from(patched)).unwrap());
                     }
                 }
             }

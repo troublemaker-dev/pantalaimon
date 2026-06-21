@@ -135,6 +135,7 @@ impl PanClient {
     /// 4. Decrypts `m.room.encrypted` timeline events, replacing them with
     ///    their cleartext equivalents in the JSON.
     pub async fn process_sync(&self, body: &mut Value) -> Result<()> {
+        let t0 = std::time::Instant::now();
         // Step 1 — collect crypto inputs from the sync response
         let to_device_events: Vec<Raw<AnyToDeviceEvent>> = body
             .pointer("/to_device/events")
@@ -174,6 +175,7 @@ impl PanClient {
         if let Err(e) = self.olm.receive_sync_changes(sync_changes, &decryption_settings).await {
             warn!("OlmMachine receive_sync_changes: {e}");
         }
+        debug!(elapsed_ms = t0.elapsed().as_millis(), "receive_sync_changes");
 
         // Step 3 — outgoing crypto requests are flushed after the response is
         // returned (see run_post_sync_tasks), so skip them here.
@@ -198,11 +200,13 @@ impl PanClient {
         }
 
         // Step 5 — decrypt m.room.encrypted timeline events
+        let t_decrypt = std::time::Instant::now();
         let room_ids: Vec<String> = body
             .pointer("/rooms/join")
             .and_then(|r| r.as_object())
             .map(|m| m.keys().cloned().collect())
             .unwrap_or_default();
+        let n_rooms = room_ids.len();
 
         for room_id_str in room_ids {
             let room_id = match RoomId::parse(&room_id_str) {
@@ -256,12 +260,15 @@ impl PanClient {
             }
         }
 
+        debug!(elapsed_ms = t_decrypt.elapsed().as_millis(), rooms = n_rooms, "decrypt loop");
+
         // Step 6 — detect new incoming verification requests
         self.check_incoming_verifications(body).await;
 
         // Steps 6-7 (check_pending_requests, check_sas_states) are also
         // deferred to run_post_sync_tasks.
 
+        debug!(elapsed_ms = t0.elapsed().as_millis(), "process_sync total");
         Ok(())
     }
 
