@@ -126,7 +126,7 @@ async fn main() -> Result<()> {
 
     for (server_name, server_conf) in &pan_conf.servers {
         let daemon =
-            ProxyDaemon::new(server_conf.clone(), store.clone(), Some(ui_tx.clone())).await?;
+            ProxyDaemon::new(server_conf.clone(), store.clone(), data_dir.clone(), Some(ui_tx.clone())).await?;
         daemons.insert(server_name.clone(), daemon);
     }
 
@@ -160,6 +160,7 @@ async fn main() -> Result<()> {
                 token,
                 server_conf.clone(),
                 store.clone(),
+                &data_dir,
                 daemon.http_client.clone(),
                 Some(ui_tx.clone()),
             )

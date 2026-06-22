@@ -25,7 +25,7 @@ tracing-subscriber = { workspace = true }
 anyhow = { workspace = true }
 thiserror = { workspace = true }
 clap = { workspace = true }
-sqlx = { workspace = true }
+rusqlite = { workspace = true }
 keyring = { workspace = true }
 configparser = { workspace = true }
 dashmap = { workspace = true }
@@ -38,9 +38,6 @@ indexmap = { workspace = true }
 
 zbus = { version = "4", default-features = false, features = ["tokio"], optional = true }
 
-# Phase 3: E2E crypto via Vodozemac.
-# matrix-sdk-sqlite is intentionally excluded to avoid a libsqlite3-sys
-# version conflict with sqlx; we use MemoryStore for now (Phase 7 will add
-# persistence via a custom CryptoStore backed by sqlx).
 matrix-sdk-crypto = { workspace = true }
+matrix-sdk-sqlite = { workspace = true }
 ruma = { workspace = true }

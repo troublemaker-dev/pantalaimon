@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{path::PathBuf, sync::Arc};
 
 use anyhow::Result;
 use axum::{body::Body, extract::Request, response::Response};
@@ -42,6 +42,7 @@ pub struct ProxyDaemon {
     pub name: String,
     pub server_conf: ServerConfig,
     pub store: Arc<PanStore>,
+    pub data_dir: PathBuf,
     pub http_client: Client,
     /// Channel to forward daemon→UI signals from freshly-created PanClients.
     pub ui_tx: Option<mpsc::Sender<DaemonToUi>>,
@@ -58,6 +59,7 @@ impl ProxyDaemon {
     pub async fn new(
         server_conf: ServerConfig,
         store: Arc<PanStore>,
+        data_dir: PathBuf,
         ui_tx: Option<mpsc::Sender<DaemonToUi>>,
     ) -> Result<Arc<Self>> {
         let mut client_builder = Client::builder();
@@ -77,6 +79,7 @@ impl ProxyDaemon {
             name: server_conf.name.clone(),
             server_conf,
             store,
+            data_dir,
             http_client,
             ui_tx,
             pan_clients: DashMap::new(),
