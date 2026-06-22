@@ -6,8 +6,8 @@ use anyhow::{Context, Result};
 use dashmap::DashMap;
 use matrix_sdk_crypto::{
     AttachmentDecryptor, AttachmentEncryptor, DecryptionSettings, EncryptionSettings,
-    EncryptionSyncChanges, LocalTrust, MediaEncryptionInfo, OlmMachine, Sas,
-    TrustRequirement,
+    EncryptionSyncChanges, LocalTrust, MediaEncryptionInfo, OlmMachine, Sas, TrustRequirement,
+    decrypt_room_key_export, encrypt_room_key_export,
     types::{
         events::room::encrypted::EncryptedEvent,
         requests::{
@@ -796,6 +796,36 @@ impl PanClient {
     }
 
     // -----------------------------------------------------------------------
+    // Key import / export
+    // -----------------------------------------------------------------------
+
+    async fn do_export_keys(&self, file_path: &str, passphrase: &str) -> Result<usize> {
+        let keys = self.olm.store().export_room_keys(|_| true).await?;
+        let count = keys.len();
+        let passphrase = passphrase.to_owned();
+        let file_path = file_path.to_owned();
+        tokio::task::spawn_blocking(move || -> Result<()> {
+            let encrypted = encrypt_room_key_export(&keys, &passphrase, 32768)?;
+            std::fs::write(&file_path, encrypted)?;
+            Ok(())
+        })
+        .await??;
+        Ok(count)
+    }
+
+    async fn do_import_keys(&self, file_path: &str, passphrase: &str) -> Result<(usize, usize)> {
+        let passphrase = passphrase.to_owned();
+        let file_path = file_path.to_owned();
+        let keys = tokio::task::spawn_blocking(move || -> Result<_> {
+            let data = std::fs::read(&file_path)?;
+            Ok(decrypt_room_key_export(std::io::Cursor::new(data), &passphrase)?)
+        })
+        .await??;
+        let result = self.olm.store().import_room_keys(keys, None, |_, _| {}).await?;
+        Ok((result.imported_count, result.total_count))
+    }
+
+    // -----------------------------------------------------------------------
     // Phase 5 — SAS device verification
     // -----------------------------------------------------------------------
 
@@ -872,12 +902,20 @@ impl PanClient {
                     Err(e) => respond!(message_id, "M_UNKNOWN", e.to_string()),
                 }
             }
-            // Key import/export and key-share decisions: Phase 7
-            UiToDaemon::ImportKeys { message_id, .. } => {
-                respond!(message_id, "M_NOT_IMPLEMENTED", "Key import: Phase 7");
+            UiToDaemon::ExportKeys { message_id, file_path, passphrase, .. } => {
+                match self.do_export_keys(&file_path, &passphrase).await {
+                    Ok(count) => respond!(message_id, "M_OK", format!("Exported {count} sessions to {file_path}")),
+                    Err(e) => respond!(message_id, "M_UNKNOWN", e.to_string()),
+                }
             }
-            UiToDaemon::ExportKeys { message_id, .. } => {
-                respond!(message_id, "M_NOT_IMPLEMENTED", "Key export: Phase 7");
+            UiToDaemon::ImportKeys { message_id, file_path, passphrase, .. } => {
+                match self.do_import_keys(&file_path, &passphrase).await {
+                    Ok((imported, total)) => respond!(
+                        message_id, "M_OK",
+                        format!("Imported {imported}/{total} sessions from {file_path}")
+                    ),
+                    Err(e) => respond!(message_id, "M_UNKNOWN", e.to_string()),
+                }
             }
             UiToDaemon::ContinueKeyShare { message_id, .. } => {
                 respond!(message_id, "M_NOT_IMPLEMENTED", "Key share: Phase 7");
