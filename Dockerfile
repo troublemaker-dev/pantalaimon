@@ -7,6 +7,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     pkg-config \
     libssl-dev \
     libdbus-1-dev \
+    libsqlite3-dev \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /build
@@ -34,6 +35,7 @@ FROM debian:bookworm-slim
 RUN apt-get update && apt-get install -y --no-install-recommends \
     libssl3 \
     libdbus-1-3 \
+    libsqlite3-0 \
     dbus \
     ca-certificates \
     && rm -rf /var/lib/apt/lists/*
