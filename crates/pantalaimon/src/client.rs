@@ -1,6 +1,6 @@
 #![allow(dead_code)]
 
-use std::{collections::{BTreeMap, HashMap}, sync::Arc};
+use std::{collections::{BTreeMap, HashMap}, path::Path, sync::Arc};
 
 use anyhow::{Context, Result};
 use dashmap::DashMap;
@@ -35,7 +35,7 @@ use ruma::{
 };
 use serde::Deserialize;
 use serde_json::{json, value::to_raw_value, Value};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use tracing::{debug, warn};
 
 use crate::{
@@ -43,6 +43,16 @@ use crate::{
     messages::{DaemonToUi, UiToDaemon},
     store::PanStore,
 };
+
+/// Outcome of `prepare_and_encrypt`.
+pub enum SendOutcome {
+    /// Room is not E2E-encrypted; caller should forward the original body.
+    NotEncrypted,
+    /// Body was encrypted; use these fields for the upstream PUT.
+    Encrypted { event_type: String, content: Value },
+    /// User (or timeout) cancelled the send; caller should return 403.
+    Cancelled,
+}
 
 /// Per-user crypto + session state, one per logged-in user.
 ///
@@ -72,6 +82,8 @@ pub struct PanClient {
     notified_show: DashMap<String, ()>,
     /// "{user_id}:{device_id}" keys for which we have already emitted SasDone.
     notified_done: DashMap<String, ()>,
+    /// Room sends pending a user decision (room_id → oneshot, true=proceed/false=cancel).
+    pending_sends: DashMap<String, oneshot::Sender<bool>>,
 }
 
 impl PanClient {
@@ -81,13 +93,21 @@ impl PanClient {
         access_token: String,
         server_conf: ServerConfig,
         store: Arc<PanStore>,
+        data_dir: &Path,
         http_client: HttpClient,
         ui_tx: Option<mpsc::Sender<DaemonToUi>>,
     ) -> Result<Self> {
         let ruma_uid = UserId::parse(&user_id)
             .with_context(|| format!("invalid user_id {user_id:?}"))?;
         let ruma_did = OwnedDeviceId::from(device_id.as_str());
-        let olm = OlmMachine::new(&ruma_uid, ruma_did.as_ref()).await;
+
+        let crypto_db = data_dir.join(format!("crypto-{}.db", user_id.replace(':', "_")));
+        let crypto_store = matrix_sdk_sqlite::SqliteCryptoStore::open(&crypto_db, None)
+            .await
+            .with_context(|| format!("Cannot open crypto store at {}", crypto_db.display()))?;
+        let olm = OlmMachine::with_store(&ruma_uid, ruma_did.as_ref(), crypto_store, None)
+            .await
+            .context("Cannot initialise OlmMachine")?;
 
         Ok(Self {
             user_id,
@@ -104,6 +124,7 @@ impl PanClient {
             notified_invite: DashMap::new(),
             notified_show: DashMap::new(),
             notified_done: DashMap::new(),
+            pending_sends: DashMap::new(),
         })
     }
 
@@ -331,9 +352,9 @@ impl PanClient {
         room_id: &str,
         event_type: &str,
         mut content: Value,
-    ) -> Result<(String, Value)> {
-        if !self.is_room_encrypted(room_id) {
-            return Ok((event_type.to_owned(), content));
+    ) -> Result<SendOutcome> {
+        if !self.fetch_room_encryption(room_id).await {
+            return Ok(SendOutcome::NotEncrypted);
         }
 
         // Inject encryption keys for any attached media before encrypting
@@ -341,6 +362,41 @@ impl PanClient {
 
         let ruma_room_id = RoomId::parse(room_id)?;
         let users = self.get_room_member_ids(&ruma_room_id).await?;
+
+        // Block if any room member has unverified devices
+        if self.has_unverified_devices(&users).await {
+            if self.pending_sends.contains_key(room_id) {
+                anyhow::bail!("another send is already pending for room {room_id}");
+            }
+
+            let room_name = self.fetch_room_display_name(room_id).await;
+            self.emit(DaemonToUi::UnverifiedDevices {
+                pan_user: self.user_id.clone(),
+                room_id: room_id.to_owned(),
+                room_display_name: room_name,
+            })
+            .await;
+
+            let (tx, rx) = oneshot::channel::<bool>();
+            self.pending_sends.insert(room_id.to_owned(), tx);
+
+            let proceed = match tokio::time::timeout(
+                std::time::Duration::from_secs(30),
+                rx,
+            )
+            .await
+            {
+                Ok(Ok(v)) => v,
+                _ => {
+                    self.pending_sends.remove(room_id);
+                    false
+                }
+            };
+
+            if !proceed {
+                return Ok(SendOutcome::Cancelled);
+            }
+        }
 
         // Claim missing 1-to-1 Olm sessions
         if let Some((txn_id, claim_req)) = self
@@ -384,7 +440,56 @@ impl PanClient {
             .await?;
         let encrypted_value = serde_json::to_value(&encrypted)?;
 
-        Ok(("m.room.encrypted".to_owned(), encrypted_value))
+        Ok(SendOutcome::Encrypted {
+            event_type: "m.room.encrypted".to_owned(),
+            content: encrypted_value,
+        })
+    }
+
+    /// Returns true if any room member (other than ourselves) has a device
+    /// with `LocalTrust::Unset` (never reviewed).
+    async fn has_unverified_devices(&self, users: &[OwnedUserId]) -> bool {
+        for user_id in users {
+            if user_id.as_str() == self.user_id {
+                continue;
+            }
+            if let Ok(devices) = self.olm.get_user_devices(user_id, None).await {
+                for device in devices.devices() {
+                    if device.local_trust_state() == LocalTrust::Unset {
+                        return true;
+                    }
+                }
+            }
+        }
+        false
+    }
+
+    /// Fetch the room display name from the homeserver, falling back to the
+    /// room_id string if the state event is missing or the request fails.
+    async fn fetch_room_display_name(&self, room_id: &str) -> String {
+        #[derive(Deserialize)]
+        struct NameEvent {
+            name: String,
+        }
+
+        let base = self.server_conf.homeserver.as_str().trim_end_matches('/');
+        let url = format!("{base}/_matrix/client/v3/rooms/{room_id}/state/m.room.name");
+
+        if let Ok(resp) = self
+            .http_client
+            .get(&url)
+            .bearer_auth(&self.access_token)
+            .send()
+            .await
+        {
+            if resp.status().is_success() {
+                if let Ok(ne) = resp.json::<NameEvent>().await {
+                    return ne.name;
+                }
+            }
+        }
+
+        room_id.to_owned()
     }
 
     // -----------------------------------------------------------------------
@@ -780,8 +885,22 @@ impl PanClient {
             UiToDaemon::CancelKeyShare { message_id, .. } => {
                 respond!(message_id, "M_NOT_IMPLEMENTED", "Key share: Phase 7");
             }
-            // SendAnyways / CancelSending are handled by ProxyDaemon, not PanClient
-            UiToDaemon::SendAnyways { .. } | UiToDaemon::CancelSending { .. } => {}
+            UiToDaemon::SendAnyways { message_id, room_id, .. } => {
+                if let Some((_, tx)) = self.pending_sends.remove(&room_id) {
+                    let _ = tx.send(true);
+                    respond!(message_id, "M_OK", "Send allowed");
+                } else {
+                    respond!(message_id, "M_NOT_FOUND", "No pending send for that room");
+                }
+            }
+            UiToDaemon::CancelSending { message_id, room_id, .. } => {
+                if let Some((_, tx)) = self.pending_sends.remove(&room_id) {
+                    let _ = tx.send(false);
+                    respond!(message_id, "M_OK", "Send cancelled");
+                } else {
+                    respond!(message_id, "M_NOT_FOUND", "No pending send for that room");
+                }
+            }
         }
     }
 

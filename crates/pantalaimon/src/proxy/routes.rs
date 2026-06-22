@@ -132,6 +132,7 @@ pub async fn login(
                     lr.access_token,
                     daemon.server_conf.clone(),
                     daemon.store.clone(),
+                    &daemon.data_dir,
                     daemon.http_client.clone(),
                     daemon.ui_tx.clone(),
                 )
@@ -337,64 +338,76 @@ pub async fn send_message(
     // Try to encrypt if we have a client for this token
     if let Some(tok) = token {
         if let Some(client) = daemon.resolve_client(&tok).await {
-            if client.fetch_room_encryption(&room_id).await {
-                match serde_json::from_slice::<serde_json::Value>(&body_bytes) {
-                    Ok(content) => {
-                        match client.prepare_and_encrypt(&room_id, &event_type, content).await {
-                            Ok((new_type, encrypted_content)) => {
-                                // Re-assemble the request with the encrypted payload
-                                let encrypted_bytes =
-                                    serde_json::to_vec(&encrypted_content).map_err(|e| {
-                                        AppError::Internal(anyhow::anyhow!(
-                                            "serialize encrypted event: {e}"
-                                        ))
-                                    })?;
+            match serde_json::from_slice::<serde_json::Value>(&body_bytes) {
+                Ok(content) => {
+                    match client.prepare_and_encrypt(&room_id, &event_type, content).await {
+                        Ok(crate::client::SendOutcome::Encrypted {
+                            event_type: new_type,
+                            content: encrypted_content,
+                        }) => {
+                            let encrypted_bytes =
+                                serde_json::to_vec(&encrypted_content).map_err(|e| {
+                                    AppError::Internal(anyhow::anyhow!(
+                                        "serialize encrypted event: {e}"
+                                    ))
+                                })?;
 
-                                let path = parts
-                                    .uri
-                                    .path()
-                                    .replacen(&event_type, &new_type, 1);
-                                let qs = parts
-                                    .uri
-                                    .query()
-                                    .map(|q| format!("?{q}"))
-                                    .unwrap_or_default();
-                                let base = daemon
-                                    .server_conf
-                                    .homeserver
-                                    .as_str()
-                                    .trim_end_matches('/');
-                                let url = format!("{base}{path}{qs}");
+                            let path = parts
+                                .uri
+                                .path()
+                                .replacen(&event_type, &new_type, 1);
+                            let qs = parts
+                                .uri
+                                .query()
+                                .map(|q| format!("?{q}"))
+                                .unwrap_or_default();
+                            let base = daemon
+                                .server_conf
+                                .homeserver
+                                .as_str()
+                                .trim_end_matches('/');
+                            let url = format!("{base}{path}{qs}");
 
-                                debug!(
-                                    %room_id,
-                                    body_len = encrypted_bytes.len(),
-                                    preview = %String::from_utf8_lossy(&encrypted_bytes[..encrypted_bytes.len().min(120)]),
-                                    "sending encrypted event to homeserver"
-                                );
-                                let mut builder =
-                                    daemon.http_client.put(&url);
-                                for (name, value) in &parts.headers {
-                                    let n = name.as_str();
-                                    if n != "host" && n != "connection" && n != "content-length" {
-                                        builder = builder.header(name.clone(), value.clone());
-                                    }
+                            debug!(
+                                %room_id,
+                                body_len = encrypted_bytes.len(),
+                                preview = %String::from_utf8_lossy(&encrypted_bytes[..encrypted_bytes.len().min(120)]),
+                                "sending encrypted event to homeserver"
+                            );
+                            let mut builder = daemon.http_client.put(&url);
+                            for (name, value) in &parts.headers {
+                                let n = name.as_str();
+                                if n != "host" && n != "connection" && n != "content-length" {
+                                    builder = builder.header(name.clone(), value.clone());
                                 }
-                                let upstream_resp =
-                                    builder.body(encrypted_bytes).send().await?;
-                                let status = upstream_resp.status();
-                                let resp_headers = upstream_resp.headers().clone();
-                                let resp_bytes = upstream_resp.bytes().await?;
-                                if !status.is_success() {
-                                    warn!(%room_id, %status, body = %String::from_utf8_lossy(&resp_bytes), "homeserver rejected encrypted send");
-                                }
-                                return build_response(status, resp_headers, resp_bytes);
                             }
-                            Err(e) => warn!(%room_id, "Encryption failed, sending plaintext: {e}"),
+                            let upstream_resp = builder.body(encrypted_bytes).send().await?;
+                            let status = upstream_resp.status();
+                            let resp_headers = upstream_resp.headers().clone();
+                            let resp_bytes = upstream_resp.bytes().await?;
+                            if !status.is_success() {
+                                warn!(%room_id, %status, body = %String::from_utf8_lossy(&resp_bytes), "homeserver rejected encrypted send");
+                            }
+                            return build_response(status, resp_headers, resp_bytes);
                         }
+                        Ok(crate::client::SendOutcome::Cancelled) => {
+                            return Ok(Response::builder()
+                                .status(StatusCode::FORBIDDEN)
+                                .header("content-type", "application/json")
+                                .body(Body::from(
+                                    serde_json::json!({
+                                        "errcode": "M_FORBIDDEN",
+                                        "error": "Send cancelled: room contains unverified devices",
+                                    })
+                                    .to_string(),
+                                ))
+                                .unwrap());
+                        }
+                        Ok(crate::client::SendOutcome::NotEncrypted) => {}
+                        Err(e) => warn!(%room_id, "Encryption error, sending plaintext: {e}"),
                     }
-                    Err(e) => debug!(%room_id, "Could not parse send body: {e}"),
                 }
+                Err(e) => debug!(%room_id, "Could not parse send body: {e}"),
             }
         }
     }

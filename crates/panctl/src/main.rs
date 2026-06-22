@@ -294,6 +294,7 @@ async fn run(cmd: Cmd, conn: &Connection) -> Result<()> {
                 println!("No devices found (user may not be tracked yet).");
                 return Ok(());
             }
+            println!("{:<20} {:<15} {}", "DEVICE ID", "TRUST STATE", "DISPLAY NAME");
             for d in &devices {
                 println!(
                     "{:<20} {:<15} {}",
