@@ -1,6 +1,6 @@
 #![allow(dead_code)]
 
-use std::{collections::{BTreeMap, HashMap}, path::Path, sync::Arc};
+use std::{collections::{BTreeMap, HashMap}, path::{Path, PathBuf}, sync::Arc};
 
 use anyhow::{Context, Result};
 use dashmap::DashMap;
@@ -17,6 +17,7 @@ use matrix_sdk_crypto::{
     },
 };
 use reqwest::Client as HttpClient;
+use rusqlite;
 use ruma::{
     api::client::{
         keys::{
@@ -52,6 +53,45 @@ pub enum SendOutcome {
     Encrypted { event_type: String, content: Value },
     /// User (or timeout) cancelled the send; caller should return 403.
     Cancelled,
+}
+
+/// Delete all but the most recently inserted inbound group session per
+/// `(room_id, sender_key)`.  Called before opening `SqliteCryptoStore` so
+/// there is no concurrent writer.  No-op if the DB doesn't exist yet.
+fn prune_old_inbound_sessions(db_path: &PathBuf) -> Result<usize> {
+    if !db_path.exists() {
+        return Ok(0);
+    }
+    let conn = rusqlite::Connection::open(db_path)?;
+    conn.execute_batch("PRAGMA journal_mode=WAL;")?;
+
+    let table_exists: bool = conn
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master \
+             WHERE type='table' AND name='inbound_group_session'",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .map(|n| n > 0)
+        .unwrap_or(false);
+
+    if !table_exists {
+        return Ok(0);
+    }
+
+    // sender_key was added in migration 009; skip legacy rows that predate it.
+    let deleted = conn.execute(
+        "DELETE FROM inbound_group_session
+         WHERE sender_key IS NOT NULL
+           AND rowid NOT IN (
+               SELECT MAX(rowid)
+               FROM   inbound_group_session
+               WHERE  sender_key IS NOT NULL
+               GROUP  BY room_id, sender_key
+           )",
+        [],
+    )?;
+    Ok(deleted)
 }
 
 /// Per-user crypto + session state, one per logged-in user.
@@ -102,6 +142,16 @@ impl PanClient {
         let ruma_did = OwnedDeviceId::from(device_id.as_str());
 
         let crypto_db = data_dir.join(format!("crypto-{}.db", user_id.replace(':', "_")));
+
+        // Drop old inbound Megolm sessions before opening the store (no concurrent access).
+        let prune_path = crypto_db.clone();
+        let pruned = tokio::task::spawn_blocking(move || prune_old_inbound_sessions(&prune_path))
+            .await
+            .context("prune task panicked")??;
+        if pruned > 0 {
+            tracing::info!(count = pruned, path = %crypto_db.display(), "pruned old inbound group sessions");
+        }
+
         let crypto_store = matrix_sdk_sqlite::SqliteCryptoStore::open(&crypto_db, None)
             .await
             .with_context(|| format!("Cannot open crypto store at {}", crypto_db.display()))?;
