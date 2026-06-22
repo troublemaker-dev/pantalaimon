@@ -41,3 +41,6 @@ zbus = { version = "4", default-features = false, features = ["tokio"], optional
 matrix-sdk-crypto = { workspace = true }
 matrix-sdk-sqlite = { workspace = true }
 ruma = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"

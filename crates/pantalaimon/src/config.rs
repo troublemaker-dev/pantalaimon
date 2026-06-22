@@ -177,3 +177,113 @@ pub fn read_config(path: &Path) -> anyhow::Result<PanConfig> {
         servers,
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+    use tempfile::NamedTempFile;
+
+    fn write_config(content: &str) -> NamedTempFile {
+        let mut f = NamedTempFile::new().unwrap();
+        f.write_all(content.as_bytes()).unwrap();
+        f
+    }
+
+    #[test]
+    fn test_minimal_config() {
+        let f = write_config(
+            "[Local]\n\
+             Homeserver = http://localhost:8448\n",
+        );
+        let cfg = read_config(f.path()).unwrap();
+        assert_eq!(cfg.servers.len(), 1);
+        let s = cfg.servers.get("Local").unwrap();
+        assert_eq!(s.homeserver.as_str(), "http://localhost:8448/");
+        assert_eq!(s.listen_port, 8009);
+        assert!(s.use_keyring);
+        assert!(!s.ignore_verification);
+    }
+
+    #[test]
+    fn test_overrides() {
+        let f = write_config(
+            "[MyServer]\n\
+             Homeserver = https://matrix.example.com\n\
+             ListenPort = 9009\n\
+             UseKeyring = false\n\
+             SSL = false\n\
+             IgnoreVerification = true\n",
+        );
+        let cfg = read_config(f.path()).unwrap();
+        let s = cfg.servers.get("MyServer").unwrap();
+        assert_eq!(s.listen_port, 9009);
+        assert!(!s.use_keyring);
+        assert!(!s.ssl);
+        assert!(s.ignore_verification);
+    }
+
+    #[test]
+    fn test_default_section_inherited() {
+        let f = write_config(
+            "[Default]\n\
+             UseKeyring = false\n\
+             \n\
+             [Local]\n\
+             Homeserver = http://localhost:8448\n",
+        );
+        let cfg = read_config(f.path()).unwrap();
+        let s = cfg.servers.get("Local").unwrap();
+        // UseKeyring from [Default] should propagate to the server
+        assert!(!s.use_keyring);
+    }
+
+    #[test]
+    fn test_multiple_servers() {
+        let f = write_config(
+            "[Alpha]\n\
+             Homeserver = http://alpha.local:8448\n\
+             ListenPort = 8010\n\
+             \n\
+             [Beta]\n\
+             Homeserver = http://beta.local:8448\n\
+             ListenPort = 8011\n",
+        );
+        let cfg = read_config(f.path()).unwrap();
+        assert_eq!(cfg.servers.len(), 2);
+        assert_eq!(cfg.servers["Alpha"].listen_port, 8010);
+        assert_eq!(cfg.servers["Beta"].listen_port, 8011);
+    }
+
+    #[test]
+    fn test_log_level_parsed() {
+        let f = write_config(
+            "[Default]\n\
+             LogLevel = debug\n\
+             \n\
+             [Local]\n\
+             Homeserver = http://localhost:8448\n",
+        );
+        let cfg = read_config(f.path()).unwrap();
+        assert_eq!(cfg.log_level, tracing::Level::DEBUG);
+    }
+
+    #[test]
+    fn test_missing_homeserver_errors() {
+        let f = write_config("[Local]\nListenPort = 8009\n");
+        assert!(read_config(f.path()).is_err());
+    }
+
+    #[test]
+    fn test_invalid_homeserver_url_errors() {
+        let f = write_config("[Local]\nHomeserver = not-a-url\n");
+        assert!(read_config(f.path()).is_err());
+    }
+
+    #[test]
+    fn test_no_servers() {
+        let f = write_config("[Default]\nLogLevel = info\n");
+        let cfg = read_config(f.path()).unwrap();
+        assert!(cfg.servers.is_empty());
+    }
+}

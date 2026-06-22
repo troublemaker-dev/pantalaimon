@@ -1409,3 +1409,123 @@ impl PanClient {
         Vec::new()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::NamedTempFile;
+
+    /// Build the minimal inbound_group_session schema that SqliteCryptoStore
+    /// creates (migrations 001 + 009), then insert `sessions` rows.
+    ///
+    /// Each session is (session_id, room_id, sender_key_hex).  Pass `None` as
+    /// sender_key_hex to simulate a pre-migration 009 legacy row.
+    fn setup_crypto_db(
+        path: &std::path::Path,
+        sessions: &[(&str, &str, Option<&str>)],
+    ) {
+        let conn = rusqlite::Connection::open(path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE \"inbound_group_session\" (
+                 \"session_id\" BLOB PRIMARY KEY NOT NULL,
+                 \"room_id\"    BLOB NOT NULL,
+                 \"backed_up\"  INTEGER NOT NULL DEFAULT 0,
+                 \"data\"       BLOB NOT NULL,
+                 \"sender_key\" BLOB,
+                 \"sender_data_type\" INTEGER
+             );",
+        )
+        .unwrap();
+        for (sid, room, sender) in sessions {
+            conn.execute(
+                "INSERT INTO inbound_group_session
+                 (session_id, room_id, backed_up, data, sender_key)
+                 VALUES (?1, ?2, 0, X'01', ?3)",
+                rusqlite::params![sid.as_bytes(), room.as_bytes(), sender.map(|s| s.as_bytes().to_vec())],
+            )
+            .unwrap();
+        }
+    }
+
+    fn count_sessions(path: &std::path::Path) -> usize {
+        let conn = rusqlite::Connection::open(path).unwrap();
+        conn.query_row(
+            "SELECT COUNT(*) FROM inbound_group_session",
+            [],
+            |r| r.get::<_, i64>(0),
+        )
+        .unwrap() as usize
+    }
+
+    #[test]
+    fn test_prune_nonexistent_path() {
+        let tmp = std::env::temp_dir().join("pantalaimon_test_nonexistent_9999.db");
+        let result = prune_old_inbound_sessions(&tmp.to_path_buf());
+        assert_eq!(result.unwrap(), 0);
+    }
+
+    #[test]
+    fn test_prune_no_table() {
+        let f = NamedTempFile::new().unwrap();
+        // DB exists but has no tables — should return 0, not error
+        let result = prune_old_inbound_sessions(&f.path().to_path_buf());
+        assert_eq!(result.unwrap(), 0);
+    }
+
+    #[test]
+    fn test_prune_no_duplicates() {
+        let f = NamedTempFile::new().unwrap();
+        setup_crypto_db(
+            f.path(),
+            &[
+                ("s1", "!roomA:h", Some("senderX")),
+                ("s2", "!roomA:h", Some("senderY")),
+                ("s3", "!roomB:h", Some("senderX")),
+            ],
+        );
+        let deleted = prune_old_inbound_sessions(&f.path().to_path_buf()).unwrap();
+        assert_eq!(deleted, 0);
+        assert_eq!(count_sessions(f.path()), 3);
+    }
+
+    #[test]
+    fn test_prune_removes_duplicates() {
+        let f = NamedTempFile::new().unwrap();
+        // roomA+senderX: 3 sessions → keep latest (s3), delete 2
+        // roomA+senderY: 1 session → untouched
+        // roomB+senderX: 2 sessions → keep latest (s6), delete 1
+        // roomC+NULL:    1 session → untouched (legacy, no sender_key)
+        setup_crypto_db(
+            f.path(),
+            &[
+                ("s1", "!roomA:h", Some("senderX")),
+                ("s2", "!roomA:h", Some("senderX")),
+                ("s3", "!roomA:h", Some("senderX")),
+                ("s4", "!roomA:h", Some("senderY")),
+                ("s5", "!roomB:h", Some("senderX")),
+                ("s6", "!roomB:h", Some("senderX")),
+                ("s7", "!roomC:h", None),
+            ],
+        );
+        let deleted = prune_old_inbound_sessions(&f.path().to_path_buf()).unwrap();
+        assert_eq!(deleted, 3, "expected 3 rows pruned");
+        // 7 total - 3 deleted = 4 remaining
+        assert_eq!(count_sessions(f.path()), 4);
+    }
+
+    #[test]
+    fn test_prune_idempotent() {
+        let f = NamedTempFile::new().unwrap();
+        setup_crypto_db(
+            f.path(),
+            &[
+                ("s1", "!roomA:h", Some("senderX")),
+                ("s2", "!roomA:h", Some("senderX")),
+            ],
+        );
+        prune_old_inbound_sessions(&f.path().to_path_buf()).unwrap();
+        let second = prune_old_inbound_sessions(&f.path().to_path_buf()).unwrap();
+        assert_eq!(second, 0, "second prune should find nothing to delete");
+        assert_eq!(count_sessions(f.path()), 1);
+    }
+}

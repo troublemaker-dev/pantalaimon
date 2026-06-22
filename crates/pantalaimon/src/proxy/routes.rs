@@ -743,3 +743,99 @@ fn build_response(
     }
     Ok(builder.body(Body::from(body)).unwrap())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::body::Body;
+
+    fn req_with_bearer(token: &str) -> Request {
+        axum::http::Request::builder()
+            .header("Authorization", format!("Bearer {token}"))
+            .body(Body::empty())
+            .unwrap()
+    }
+
+    fn req_with_query(token: &str) -> Request {
+        axum::http::Request::builder()
+            .uri(format!("/_matrix/client/v3/sync?access_token={token}&timeout=30000"))
+            .body(Body::empty())
+            .unwrap()
+    }
+
+    fn req_empty() -> Request {
+        axum::http::Request::builder().body(Body::empty()).unwrap()
+    }
+
+    #[test]
+    fn test_extract_token_bearer() {
+        let req = req_with_bearer("syt_abc123");
+        assert_eq!(extract_token(&req), Some("syt_abc123".to_owned()));
+    }
+
+    #[test]
+    fn test_extract_token_query_param() {
+        let req = req_with_query("syt_xyz789");
+        assert_eq!(extract_token(&req), Some("syt_xyz789".to_owned()));
+    }
+
+    #[test]
+    fn test_extract_token_bearer_takes_priority() {
+        let req = axum::http::Request::builder()
+            .uri("/_matrix/client/v3/sync?access_token=from_query")
+            .header("Authorization", "Bearer from_header")
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(extract_token(&req), Some("from_header".to_owned()));
+    }
+
+    #[test]
+    fn test_extract_token_none() {
+        let req = req_empty();
+        assert_eq!(extract_token(&req), None);
+    }
+
+    #[test]
+    fn test_mxc_from_path_standard() {
+        let path = "/_matrix/media/v3/download/matrix.org/abc123";
+        assert_eq!(mxc_from_path(path), Some(("matrix.org", "abc123")));
+    }
+
+    #[test]
+    fn test_mxc_from_path_with_filename() {
+        let path = "/_matrix/media/v3/download/matrix.org/abc123/photo.jpg";
+        assert_eq!(mxc_from_path(path), Some(("matrix.org", "abc123")));
+    }
+
+    #[test]
+    fn test_mxc_from_path_r0_variant() {
+        let path = "/_matrix/media/r0/download/example.com/xyz";
+        assert_eq!(mxc_from_path(path), Some(("example.com", "xyz")));
+    }
+
+    #[test]
+    fn test_mxc_from_path_no_download_segment() {
+        let path = "/_matrix/media/v3/upload";
+        assert_eq!(mxc_from_path(path), None);
+    }
+
+    #[test]
+    fn test_mxc_from_path_missing_media_id() {
+        // Only server name, no media_id
+        let path = "/_matrix/media/v3/download/matrix.org";
+        assert_eq!(mxc_from_path(path), None);
+    }
+
+    #[test]
+    fn test_should_strip_response_header_hops() {
+        for h in &["connection", "transfer-encoding", "content-encoding", "content-length"] {
+            assert!(should_strip_response_header(h), "{h} should be stripped");
+        }
+    }
+
+    #[test]
+    fn test_should_strip_response_header_keeps_content_type() {
+        assert!(!should_strip_response_header("content-type"));
+        assert!(!should_strip_response_header("x-matrix-server"));
+    }
+}

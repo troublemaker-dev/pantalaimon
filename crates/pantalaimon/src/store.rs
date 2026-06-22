@@ -600,3 +600,166 @@ impl PanStore {
         .context("spawn_blocking panicked")?
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    async fn make_store() -> (PanStore, TempDir) {
+        let dir = TempDir::new().unwrap();
+        let store = PanStore::new(dir.path()).await.unwrap();
+        (store, dir)
+    }
+
+    #[tokio::test]
+    async fn test_schema_version() {
+        let (store, _dir) = make_store().await;
+        let ver = store.schema_version().await.unwrap();
+        assert_eq!(ver, 1);
+    }
+
+    #[tokio::test]
+    async fn test_server_user_roundtrip() {
+        let (store, _dir) = make_store().await;
+        store.save_server_user("local", "@alice:localhost").await.unwrap();
+        let users = store.load_users("local").await.unwrap();
+        assert_eq!(users, vec!["@alice:localhost"]);
+    }
+
+    #[tokio::test]
+    async fn test_server_user_idempotent() {
+        let (store, _dir) = make_store().await;
+        store.save_server_user("local", "@alice:localhost").await.unwrap();
+        store.save_server_user("local", "@alice:localhost").await.unwrap();
+        let users = store.load_users("local").await.unwrap();
+        assert_eq!(users.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_load_users_empty_server() {
+        let (store, _dir) = make_store().await;
+        let users = store.load_users("nonexistent").await.unwrap();
+        assert!(users.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_access_token_roundtrip() {
+        let (store, _dir) = make_store().await;
+        store.save_access_token("@alice:localhost", "DEVICE1", "tok_abc").await.unwrap();
+        let got = store.load_access_token("@alice:localhost", "DEVICE1").await.unwrap();
+        assert_eq!(got, Some("tok_abc".to_owned()));
+    }
+
+    #[tokio::test]
+    async fn test_access_token_update() {
+        let (store, _dir) = make_store().await;
+        store.save_access_token("@alice:localhost", "D1", "old_tok").await.unwrap();
+        store.save_access_token("@alice:localhost", "D1", "new_tok").await.unwrap();
+        let got = store.load_access_token("@alice:localhost", "D1").await.unwrap();
+        assert_eq!(got, Some("new_tok".to_owned()));
+    }
+
+    #[tokio::test]
+    async fn test_access_token_missing() {
+        let (store, _dir) = make_store().await;
+        let got = store.load_access_token("@nobody:localhost", "D1").await.unwrap();
+        assert!(got.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_session_tokens() {
+        let (store, _dir) = make_store().await;
+        store.save_server_user("local", "@alice:localhost").await.unwrap();
+        store.save_access_token("@alice:localhost", "D1", "tok_alice").await.unwrap();
+        let rows = store.load_session_tokens("local").await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].0, "@alice:localhost");
+        assert_eq!(rows[0].2, "tok_alice");
+    }
+
+    #[tokio::test]
+    async fn test_sync_token_roundtrip() {
+        let (store, _dir) = make_store().await;
+        store.save_sync_token("local", "@alice:localhost", "s123_456").await.unwrap();
+        let got = store.load_sync_token("local", "@alice:localhost").await.unwrap();
+        assert_eq!(got, Some("s123_456".to_owned()));
+    }
+
+    #[tokio::test]
+    async fn test_sync_token_update() {
+        let (store, _dir) = make_store().await;
+        store.save_sync_token("local", "@alice:localhost", "s1").await.unwrap();
+        store.save_sync_token("local", "@alice:localhost", "s2").await.unwrap();
+        let got = store.load_sync_token("local", "@alice:localhost").await.unwrap();
+        assert_eq!(got, Some("s2".to_owned()));
+    }
+
+    #[tokio::test]
+    async fn test_media_roundtrip() {
+        let (store, _dir) = make_store().await;
+        let key_json = serde_json::json!({"kty":"oct","k":"AAAA","alg":"A256CTR","ext":true});
+        let hashes_json = serde_json::json!({"sha256":"abc123"});
+        let media = MediaInfo {
+            mxc_server: "matrix.org".to_owned(),
+            mxc_path: "abc123def456".to_owned(),
+            key: key_json.clone(),
+            iv: "AAAAAAAAAAAAAAAA".to_owned(),
+            hashes: hashes_json.clone(),
+        };
+        store.save_media("local", &media).await.unwrap();
+        let got = store.load_media("local", "matrix.org", "abc123def456").await.unwrap();
+        let got = got.expect("media should be found");
+        assert_eq!(got.mxc_server, "matrix.org");
+        assert_eq!(got.mxc_path, "abc123def456");
+        assert_eq!(got.iv, "AAAAAAAAAAAAAAAA");
+        assert_eq!(got.hashes, hashes_json);
+    }
+
+    #[tokio::test]
+    async fn test_media_missing() {
+        let (store, _dir) = make_store().await;
+        let got = store.load_media("local", "matrix.org", "doesnotexist").await.unwrap();
+        assert!(got.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_upload_roundtrip() {
+        let (store, _dir) = make_store().await;
+        store
+            .save_upload("local", "mxc://matrix.org/file1", "photo.jpg", "image/jpeg")
+            .await
+            .unwrap();
+        let got = store.load_upload("local", "mxc://matrix.org/file1").await.unwrap();
+        let got = got.expect("upload should be found");
+        assert_eq!(got.filename, "photo.jpg");
+        assert_eq!(got.mimetype, "image/jpeg");
+    }
+
+    #[tokio::test]
+    async fn test_upload_missing() {
+        let (store, _dir) = make_store().await;
+        let got = store.load_upload("local", "mxc://matrix.org/nope").await.unwrap();
+        assert!(got.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_fetcher_task_roundtrip() {
+        let (store, _dir) = make_store().await;
+        let task = FetchTask { room_id: "!room:localhost".to_owned(), token: "t1".to_owned() };
+        store.save_fetcher_task("local", "@alice:localhost", &task).await.unwrap();
+        let tasks = store.load_fetcher_tasks("local", "@alice:localhost").await.unwrap();
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].room_id, "!room:localhost");
+    }
+
+    #[tokio::test]
+    async fn test_fetcher_task_delete() {
+        let (store, _dir) = make_store().await;
+        let task = FetchTask { room_id: "!room:localhost".to_owned(), token: "t1".to_owned() };
+        store.save_fetcher_task("local", "@alice:localhost", &task).await.unwrap();
+        store.delete_fetcher_task("local", "@alice:localhost", &task).await.unwrap();
+        let tasks = store.load_fetcher_tasks("local", "@alice:localhost").await.unwrap();
+        assert!(tasks.is_empty());
+    }
+}
