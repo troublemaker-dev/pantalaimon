@@ -150,6 +150,14 @@ pub enum UiToDaemon {
         user_id: String,
         device_id: String,
     },
+
+    /// Restore cross-signing identity from the SSSS security key or passphrase.
+    RecoverIdentity {
+        message_id: String,
+        pan_user: String,
+        /// Raw input — either the Base58 recovery key or a passphrase.
+        key_input: String,
+    },
 }
 
 impl UiToDaemon {
@@ -169,7 +177,8 @@ impl UiToDaemon {
             | UiToDaemon::ConfirmSas { pan_user, .. }
             | UiToDaemon::AcceptSas { pan_user, .. }
             | UiToDaemon::ContinueKeyShare { pan_user, .. }
-            | UiToDaemon::CancelKeyShare { pan_user, .. } => pan_user,
+            | UiToDaemon::CancelKeyShare { pan_user, .. }
+            | UiToDaemon::RecoverIdentity { pan_user, .. } => pan_user,
         }
     }
 
@@ -189,7 +198,8 @@ impl UiToDaemon {
             | UiToDaemon::ConfirmSas { message_id, .. }
             | UiToDaemon::AcceptSas { message_id, .. }
             | UiToDaemon::ContinueKeyShare { message_id, .. }
-            | UiToDaemon::CancelKeyShare { message_id, .. } => message_id,
+            | UiToDaemon::CancelKeyShare { message_id, .. }
+            | UiToDaemon::RecoverIdentity { message_id, .. } => message_id,
         }
     }
 }

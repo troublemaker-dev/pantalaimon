@@ -4,6 +4,7 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use futures_util::StreamExt;
 use zbus::Connection;
+use rpassword;
 
 // ---------------------------------------------------------------------------
 // D-Bus proxy traits
@@ -76,6 +77,11 @@ trait Control {
         pan_user: &str,
         user_id: &str,
         device_id: &str,
+    ) -> zbus::Result<String>;
+    async fn recover_identity(
+        &self,
+        pan_user: &str,
+        key_input: &str,
     ) -> zbus::Result<String>;
 }
 
@@ -207,14 +213,27 @@ enum Cmd {
     ImportKeys {
         pan_user: String,
         file_path: String,
-        passphrase: String,
+        /// Passphrase for the key export file. If omitted, prompts securely (no shell history).
+        #[arg(long, short = 'p')]
+        passphrase: Option<String>,
     },
 
     /// Export E2E keys to a file
     ExportKeys {
         pan_user: String,
         file_path: String,
-        passphrase: String,
+        /// Passphrase to protect the key export file. If omitted, prompts securely (no shell history).
+        #[arg(long, short = 'p')]
+        passphrase: Option<String>,
+    },
+
+    /// Restore cross-signing identity from the SSSS security key or passphrase
+    RecoverIdentity {
+        /// Your pantalaimon session user (@you:server)
+        pan_user: String,
+        /// Security key (Base58 recovery key) or passphrase. If omitted, prompts securely (no shell history).
+        #[arg(long, short = 'k')]
+        key: Option<String>,
     },
 
     /// Send a blocked message despite unverified devices
@@ -376,14 +395,23 @@ async fn run(cmd: Cmd, conn: &Connection) -> Result<()> {
         }
 
         Cmd::ImportKeys { pan_user, file_path, passphrase } => {
+            let passphrase = read_secret("Passphrase: ", passphrase)?;
             let mut stream = zbus::MessageStream::from(conn);
             let mid = ctrl.import_keys(&pan_user, &file_path, &passphrase).await?;
             wait_response(&mut stream, &mid).await?;
         }
 
         Cmd::ExportKeys { pan_user, file_path, passphrase } => {
+            let passphrase = read_secret("Passphrase: ", passphrase)?;
             let mut stream = zbus::MessageStream::from(conn);
             let mid = ctrl.export_keys(&pan_user, &file_path, &passphrase).await?;
+            wait_response(&mut stream, &mid).await?;
+        }
+
+        Cmd::RecoverIdentity { pan_user, key } => {
+            let key_input = read_secret("Security key or passphrase: ", key)?;
+            let mut stream = zbus::MessageStream::from(conn);
+            let mid = ctrl.recover_identity(&pan_user, &key_input).await?;
             wait_response(&mut stream, &mid).await?;
         }
 
@@ -413,6 +441,21 @@ async fn run(cmd: Cmd, conn: &Connection) -> Result<()> {
     }
 
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Secret input helper
+// ---------------------------------------------------------------------------
+
+/// Return `cli_value` if provided, otherwise prompt on the terminal without echo.
+///
+/// Always reading from the terminal (not stdin) means the secret never appears
+/// in shell history regardless of how the command was invoked.
+fn read_secret(prompt: &str, cli_value: Option<String>) -> Result<String> {
+    match cli_value {
+        Some(v) => Ok(v),
+        None => rpassword::prompt_password(prompt).context("Failed to read secret from terminal"),
+    }
 }
 
 // ---------------------------------------------------------------------------

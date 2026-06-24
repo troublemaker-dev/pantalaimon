@@ -334,6 +334,18 @@ impl ControlIface {
         message_id
     }
 
+    async fn recover_identity(&self, pan_user: String, key_input: String) -> String {
+        let message_id = self.state.next_id();
+        self.state
+            .send(UiToDaemon::RecoverIdentity {
+                message_id: message_id.clone(),
+                pan_user,
+                key_input,
+            })
+            .await;
+        message_id
+    }
+
     async fn continue_key_share(
         &self,
         pan_user: String,

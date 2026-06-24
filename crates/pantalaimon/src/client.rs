@@ -5,9 +5,11 @@ use std::{collections::{BTreeMap, HashMap}, path::{Path, PathBuf}, sync::Arc};
 use anyhow::{Context, Result};
 use dashmap::DashMap;
 use matrix_sdk_crypto::{
-    AttachmentDecryptor, AttachmentEncryptor, DecryptionSettings, EncryptionSettings,
-    EncryptionSyncChanges, LocalTrust, MediaEncryptionInfo, OlmMachine, Sas, TrustRequirement,
+    AttachmentDecryptor, AttachmentEncryptor, CrossSigningKeyExport, DecryptionSettings,
+    EncryptionSettings, EncryptionSyncChanges, LocalTrust, MediaEncryptionInfo, OlmMachine,
+    Sas, TrustRequirement,
     decrypt_room_key_export, encrypt_room_key_export,
+    secret_storage::{AesHmacSha2EncryptedData, SecretStorageKey},
     types::{
         events::room::encrypted::EncryptedEvent,
         requests::{
@@ -30,7 +32,15 @@ use ruma::{
         sync::sync_events::DeviceLists,
         to_device::send_event_to_device::v3::Response as ToDeviceResponse,
     },
-    events::{AnyToDeviceEvent, MessageLikeEventContent as _},
+    events::{
+        AnyToDeviceEvent, EventContentFromType, MessageLikeEventContent as _,
+        secret::request::SecretName,
+        secret_storage::{
+            default_key::SecretStorageDefaultKeyEventContent,
+            key::SecretStorageKeyEventContent,
+            secret::SecretEventContent,
+        },
+    },
     serde::Raw,
     EventId, OneTimeKeyAlgorithm, OwnedDeviceId, OwnedUserId, RoomId, UInt, UserId,
 };
@@ -998,6 +1008,12 @@ impl PanClient {
                     respond!(message_id, "M_NOT_FOUND", "No pending send for that room");
                 }
             }
+            UiToDaemon::RecoverIdentity { message_id, key_input, .. } => {
+                match self.do_recover_identity(&key_input).await {
+                    Ok(()) => respond!(message_id, "M_OK", "Cross-signing keys imported and signatures uploaded"),
+                    Err(e) => respond!(message_id, "M_UNKNOWN", e.to_string()),
+                }
+            }
         }
     }
 
@@ -1137,6 +1153,148 @@ impl PanClient {
             .with_context(|| format!("device {device_id} not found for {user_id}"))?;
         device.set_local_trust(trust).await?;
         Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    // SSSS / cross-signing identity recovery
+    // -----------------------------------------------------------------------
+
+    /// Restore cross-signing keys from the SSSS security key or passphrase.
+    ///
+    /// `key_input` is either the Base58-encoded recovery key (spaces ignored)
+    /// or a passphrase.  `SecretStorageKey::from_account_data` tries passphrase
+    /// derivation first when the key info indicates one was set, then falls back
+    /// to Base58; otherwise it goes straight to Base58.  The MAC check built into
+    /// the key constructor catches a wrong input before we attempt any decryption.
+    async fn do_recover_identity(&self, key_input: &str) -> Result<()> {
+        let base = self.server_conf.homeserver.as_str().trim_end_matches('/');
+        let token = &self.access_token;
+        let uid = &self.user_id;
+
+        // 1. Find the default SSSS key ID.
+        let default_key: SecretStorageDefaultKeyEventContent = self
+            .fetch_account_data(base, token, uid, "m.secret_storage.default_key")
+            .await
+            .context("Cannot fetch m.secret_storage.default_key — set up a Security Key in your client first")?;
+
+        let key_id = default_key.key_id;
+        info!(%key_id, "found SSSS default key");
+
+        // 2. Fetch the key info (algorithm, passphrase params, MAC check values).
+        let event_type = format!("m.secret_storage.key.{key_id}");
+        let key_info_json: serde_json::Value = self
+            .fetch_account_data(base, token, uid, &event_type)
+            .await
+            .context("Cannot fetch secret storage key info")?;
+
+        let key_info = SecretStorageKeyEventContent::from_parts(
+            &event_type,
+            &serde_json::value::to_raw_value(&key_info_json)
+                .context("Cannot re-encode key info")?,
+        )
+        .context("Cannot parse secret storage key info")?;
+
+        // 3. Reconstruct the SecretStorageKey — this validates the input against
+        //    the stored MAC, so a wrong key/passphrase is caught here.
+        let storage_key = SecretStorageKey::from_account_data(key_input, key_info)
+            .map_err(|e| anyhow::anyhow!("Security key or passphrase rejected: {e}"))?;
+
+        info!(%key_id, "security key verified");
+
+        // 4. Decrypt the three cross-signing secrets and import them.
+        let master = self
+            .decrypt_ssss_secret(base, token, uid, &storage_key, &key_id, SecretName::CrossSigningMasterKey)
+            .await
+            .context("Cannot decrypt master cross-signing key")?;
+
+        let self_signing = self
+            .decrypt_ssss_secret(base, token, uid, &storage_key, &key_id, SecretName::CrossSigningSelfSigningKey)
+            .await
+            .context("Cannot decrypt self-signing cross-signing key")?;
+
+        let user_signing = self
+            .decrypt_ssss_secret(base, token, uid, &storage_key, &key_id, SecretName::CrossSigningUserSigningKey)
+            .await
+            .context("Cannot decrypt user-signing cross-signing key")?;
+
+        self.olm
+            .import_cross_signing_keys(CrossSigningKeyExport {
+                master_key: Some(master),
+                self_signing_key: Some(self_signing),
+                user_signing_key: Some(user_signing),
+            })
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to import cross-signing keys: {e}"))?;
+
+        info!("cross-signing keys imported; uploading signatures");
+
+        // 5. Immediately flush outgoing requests so device signatures are uploaded
+        //    without waiting for the next sync cycle.
+        self.process_outgoing_requests().await;
+
+        Ok(())
+    }
+
+    /// GET `/_matrix/client/v3/user/{uid}/account_data/{event_type}` and
+    /// deserialize the response body.
+    async fn fetch_account_data<T: serde::de::DeserializeOwned>(
+        &self,
+        base: &str,
+        token: &str,
+        uid: &str,
+        event_type: &str,
+    ) -> Result<T> {
+        let url = format!("{base}/_matrix/client/v3/user/{uid}/account_data/{event_type}");
+        let resp = self
+            .http_client
+            .get(&url)
+            .header("authorization", format!("Bearer {token}"))
+            .send()
+            .await
+            .with_context(|| format!("GET {event_type}"))?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            anyhow::bail!("GET {event_type}: {status}: {body}");
+        }
+
+        resp.json().await.with_context(|| format!("Deserialise {event_type}"))
+    }
+
+    /// Fetch one encrypted SSSS secret, decrypt it, and return the UTF-8 plaintext.
+    async fn decrypt_ssss_secret(
+        &self,
+        base: &str,
+        token: &str,
+        uid: &str,
+        storage_key: &SecretStorageKey,
+        key_id: &str,
+        secret_name: SecretName,
+    ) -> Result<String> {
+        let type_str = secret_name.as_str();
+        let content: SecretEventContent = self
+            .fetch_account_data(base, token, uid, type_str)
+            .await
+            .with_context(|| format!("Cannot fetch {type_str}"))?;
+
+        let encrypted = content
+            .encrypted
+            .get(key_id)
+            .with_context(|| format!("{type_str} is not encrypted with key {key_id}"))?;
+
+        let encrypted_data: AesHmacSha2EncryptedData = encrypted
+            .clone()
+            .try_into()
+            .map_err(|e: serde_json::Error| {
+                anyhow::anyhow!("Invalid encrypted payload for {type_str}: {e}")
+            })?;
+
+        let plaintext = storage_key
+            .decrypt(&encrypted_data, &secret_name)
+            .map_err(|e| anyhow::anyhow!("Decryption failed for {type_str}: {e}"))?;
+
+        String::from_utf8(plaintext).context("Decrypted key is not valid UTF-8")
     }
 
     /// Scan to-device events in the sync body for incoming verification requests

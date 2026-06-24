@@ -33,6 +33,7 @@ http = "1"
 url = { version = "2", features = ["serde"] }
 indexmap = "2"
 clap_mangen = "0.2"
+rpassword = "7"
 matrix-sdk-crypto = "0.16.1"
 matrix-sdk-sqlite = { version = "0.16", features = ["crypto-store"] }
 ruma = { version = "0.14", features = ["client-api-c"] }
