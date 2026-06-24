@@ -177,6 +177,14 @@ pub async fn sync(
 
     if is_initial_sync {
         debug!("initial sync — proxy-passing without processing");
+        // Trigger PanClient creation in the background while the homeserver
+        // is generating the (potentially slow) full-state response.  Without
+        // this, a daemon restart followed by a resync never fires resolve_client
+        // and panctl commands fail with "no PanClient for user".
+        if let Some(tok) = token {
+            let d = daemon.clone();
+            tokio::spawn(async move { d.resolve_client(&tok).await });
+        }
         return daemon.forward_request(req).await;
     }
 

@@ -37,7 +37,7 @@ use ruma::{
 use serde::Deserialize;
 use serde_json::{json, value::to_raw_value, Value};
 use tokio::sync::{mpsc, oneshot};
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 use crate::{
     config::ServerConfig,
@@ -141,10 +141,19 @@ impl PanClient {
             .with_context(|| format!("invalid user_id {user_id:?}"))?;
         let ruma_did = OwnedDeviceId::from(device_id.as_str());
 
-        let crypto_db = data_dir.join(format!("crypto-{}.db", user_id.replace(':', "_")));
+        // SqliteCryptoStore::open takes a directory; it creates
+        // matrix-sdk-crypto.sqlite3 inside it.  Include device_id so that
+        // multiple sessions for the same user each get their own store.
+        let sanitized_uid = user_id.trim_start_matches('@').replace(':', "_");
+        let sanitized_did = device_id
+            .chars()
+            .map(|c| if c.is_ascii_alphanumeric() || c == '-' { c } else { '_' })
+            .collect::<String>();
+        let crypto_db = data_dir.join(format!("crypto-{}_{}", sanitized_uid, sanitized_did));
 
         // Drop old inbound Megolm sessions before opening the store (no concurrent access).
-        let prune_path = crypto_db.clone();
+        // The actual SQLite file is matrix-sdk-crypto.sqlite3 inside the crypto_db directory.
+        let prune_path = crypto_db.join("matrix-sdk-crypto.sqlite3");
         let pruned = tokio::task::spawn_blocking(move || prune_old_inbound_sessions(&prune_path))
             .await
             .context("prune task panicked")??;
@@ -1002,6 +1011,13 @@ impl PanClient {
     ) -> Result<()> {
         let uid = UserId::parse(user_id)?;
         let did = OwnedDeviceId::from(device_id);
+
+        // The OlmMachine may not yet know this device (fresh store or first
+        // contact).  Fetch keys on demand so we don't rely on a prior sync.
+        if self.olm.get_device(&uid, &did, None).await?.is_none() {
+            self.refresh_device_keys(&uid).await;
+        }
+
         let device = self
             .olm
             .get_device(&uid, &did, None)
@@ -1009,10 +1025,11 @@ impl PanClient {
             .with_context(|| format!("device {device_id} not found for {user_id}"))?;
 
         let (verification_request, outgoing) = device.request_verification();
+        let flow_id = verification_request.flow_id().as_str().to_owned();
+        info!(%user_id, %device_id, %flow_id, "sending SAS verification request");
         self.send_outgoing_verification(base, token, &outgoing).await;
 
         // Record the flow_id so check_pending_requests calls start_sas when ready.
-        let flow_id = verification_request.flow_id().as_str().to_owned();
         self.pending_requests.insert(flow_id, user_id.to_owned());
 
         Ok(())
@@ -1206,17 +1223,19 @@ impl PanClient {
             }
 
             if req.is_ready() {
+                info!(%user_id_str, %flow_id, "remote accepted verification; starting SAS");
                 match req.start_sas().await {
                     Ok(Some((sas, outgoing))) => {
                         self.send_outgoing_verification(base, token, &outgoing).await;
                         let device_id = sas.other_device_id().to_string();
+                        info!(%user_id_str, %device_id, %flow_id, "SAS started; waiting for key exchange");
                         self.active_sas
                             .insert(format!("{user_id_str}:{device_id}"), sas);
                         to_remove.push(flow_id);
                     }
                     Ok(None) => {} // not ready yet
                     Err(e) => {
-                        warn!("start_sas on pending request: {e}");
+                        warn!(%flow_id, "start_sas on pending request: {e}");
                         to_remove.push(flow_id);
                     }
                 }
@@ -1238,6 +1257,13 @@ impl PanClient {
             let sas = entry.value().clone();
 
             if sas.is_cancelled() || sas.is_done() {
+                info!(
+                    user_id = %sas.other_user_id(),
+                    device_id = %sas.other_device_id(),
+                    flow_id = %sas.flow_id().as_str(),
+                    cancelled = sas.is_cancelled(),
+                    "SAS flow ended"
+                );
                 if !self.notified_done.contains_key(&key) {
                     self.notified_done.insert(key.clone(), ());
                     self.emit(DaemonToUi::SasDone {
@@ -1255,6 +1281,11 @@ impl PanClient {
             if let Some(emojis) = sas.emoji() {
                 if !self.notified_show.contains_key(&key) {
                     self.notified_show.insert(key.clone(), ());
+                    info!(
+                        user_id = %sas.other_user_id(),
+                        device_id = %sas.other_device_id(),
+                        "SAS emoji ready"
+                    );
                     let emoji_vec: Vec<(String, String)> = emojis
                         .iter()
                         .map(|e| (e.symbol.to_owned(), e.description.to_owned()))
@@ -1366,11 +1397,24 @@ impl PanClient {
     // Device listing (for D-Bus queries)
     // -----------------------------------------------------------------------
 
+    /// Fetch fresh device keys for `user_id` from the homeserver right now.
+    ///
+    /// Called before operations that need an up-to-date device list (listing,
+    /// verification) without waiting for the next sync cycle to trigger it.
+    async fn refresh_device_keys(&self, uid: &UserId) {
+        let base = self.server_conf.homeserver.as_str().trim_end_matches('/');
+        let (txn_id, query_req) = self.olm.query_keys_for_users([uid]);
+        if let Err(e) = self.send_keys_query(base, &self.access_token, &query_req, &txn_id).await {
+            warn!(%uid, "refresh_device_keys: {e}");
+        }
+    }
+
     pub async fn list_user_devices(&self, user_id: &str) -> Vec<HashMap<String, String>> {
         let uid = match UserId::parse(user_id) {
             Ok(u) => u,
             Err(_) => return Vec::new(),
         };
+        self.refresh_device_keys(&uid).await;
         match self.olm.get_user_devices(&uid, None).await {
             Ok(devices) => devices
                 .devices()

@@ -7,7 +7,7 @@ use dashmap::DashMap;
 use http::header::HeaderName;
 use reqwest::Client;
 use serde::Deserialize;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 use tokio::sync::mpsc;
 
@@ -113,13 +113,14 @@ impl ProxyDaemon {
         self.token_to_user.contains_key(token)
     }
 
-    #[allow(dead_code)]
     /// Find the `PanClient` that owns `token`.
     ///
     /// Fast path: `token_to_user` cache hit → O(1) lookup.
-    /// Slow path: call `/_matrix/client/v3/whoami` to resolve the token,
-    /// then cache the result.  Returns `None` if the token is invalid or
-    /// the user was never seen through pantalaimon.
+    /// Slow path: call `/_matrix/client/v3/whoami` to resolve the token.
+    /// If the token is valid but no PanClient exists (e.g. daemon restarted
+    /// and ement resumed with its stored token without a fresh login), a
+    /// PanClient is created on the fly and the session is persisted so the
+    /// next restart finds it without needing whoami.
     pub async fn resolve_client(&self, token: &str) -> Option<Arc<PanClient>> {
         // Fast path
         if let Some(user_id) = self.token_to_user.get(token) {
@@ -130,6 +131,7 @@ impl ProxyDaemon {
         #[derive(Deserialize)]
         struct WhoamiResp {
             user_id: String,
+            device_id: Option<String>,
         }
 
         let base = self.server_conf.homeserver.as_str().trim_end_matches('/');
@@ -149,21 +151,50 @@ impl ProxyDaemon {
 
         let whoami: WhoamiResp = resp.json().await.ok()?;
         let user_id = whoami.user_id;
+        let device_id = whoami.device_id.unwrap_or_else(|| "UNKNOWN".to_owned());
 
-        // Cache the mapping so future requests skip the network call.
+        // Cache the token → user_id mapping for future requests.
         self.token_to_user.insert(token.to_owned(), user_id.clone());
 
-        match self.pan_clients.get(&user_id) {
-            Some(client) => Some(client.clone()),
-            None => {
-                // The user logged in directly to the homeserver, bypassing
-                // pantalaimon.  We cannot do crypto for them, but we let the
-                // request through transparently.
-                warn!(
-                    %user_id,
-                    "Token resolved via whoami but user has no PanClient \
-                     (logged in outside pantalaimon)"
-                );
+        // If a PanClient already exists (restored from DB at startup), return it.
+        if let Some(client) = self.pan_clients.get(&user_id) {
+            return Some(client.clone());
+        }
+
+        // No PanClient yet — the user has a valid token but this daemon
+        // instance never intercepted their login (e.g. daemon restarted and
+        // ement reused its stored token).  Create a client on the fly so
+        // crypto works immediately, and persist the session so the next
+        // restart restores it properly without this whoami call.
+        info!(%user_id, %device_id, "auto-creating PanClient for resumed session");
+
+        if let Err(e) = self.store.save_access_token(&user_id, &device_id, token).await {
+            warn!(%user_id, "save_access_token: {e}");
+        }
+        if let Err(e) = self.store.save_server_user(&self.name, &user_id).await {
+            warn!(%user_id, "save_server_user: {e}");
+        }
+
+        match crate::client::PanClient::new(
+            user_id.clone(),
+            device_id,
+            token.to_owned(),
+            self.server_conf.clone(),
+            self.store.clone(),
+            &self.data_dir,
+            self.http_client.clone(),
+            self.ui_tx.clone(),
+        )
+        .await
+        {
+            Ok(client) => {
+                let client = Arc::new(client);
+                client.clone().start_sync().await;
+                self.register_client(client.clone());
+                Some(client)
+            }
+            Err(e) => {
+                warn!(%user_id, "auto-create PanClient failed: {e}");
                 None
             }
         }

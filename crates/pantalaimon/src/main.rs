@@ -134,6 +134,12 @@ async fn main() -> Result<()> {
     for (server_name, server_conf) in &pan_conf.servers {
         let sessions = store.load_session_tokens(server_name).await?;
 
+        if sessions.is_empty() {
+            info!(server = %server_name, "No saved sessions to restore — waiting for first login");
+        } else {
+            info!(server = %server_name, count = sessions.len(), "Restoring saved sessions");
+        }
+
         for (user_id, device_id, db_token) in sessions {
             let token = if server_conf.use_keyring {
                 load_from_keyring(&user_id, &device_id).unwrap_or(db_token.clone())
@@ -179,7 +185,10 @@ async fn main() -> Result<()> {
     }
 
     // Message router: dispatches D-Bus commands to the right PanClient.
+    // Needs its own ui_tx handle so it can reply with an error when no client
+    // is found — otherwise panctl hangs until its signal timeout.
     let daemons_for_router = daemons.clone();
+    let router_ui_tx = ui_tx.clone();
     tokio::spawn(async move {
         let mut rx = pan_rx;
         while let Some(cmd) = rx.recv().await {
@@ -193,7 +202,15 @@ async fn main() -> Result<()> {
                 }
             }
             if !found {
-                warn!(user_id = %user, "message_router: no PanClient for user");
+                warn!(user_id = %user, "message_router: no PanClient for user — not logged in through pantalaimon?");
+                let _ = router_ui_tx
+                    .send(DaemonToUi::Response {
+                        message_id: cmd.message_id().to_owned(),
+                        pan_user: user,
+                        code: "M_NOT_FOUND".to_owned(),
+                        message: "No session for that user — log in through pantalaimon first".to_owned(),
+                    })
+                    .await;
             }
         }
     });

@@ -172,4 +172,24 @@ impl UiToDaemon {
             | UiToDaemon::CancelKeyShare { pan_user, .. } => pan_user,
         }
     }
+
+    /// Extract the `message_id` field present in every variant.
+    pub fn message_id(&self) -> &str {
+        match self {
+            UiToDaemon::SendAnyways { message_id, .. }
+            | UiToDaemon::CancelSending { message_id, .. }
+            | UiToDaemon::VerifyDevice { message_id, .. }
+            | UiToDaemon::UnverifyDevice { message_id, .. }
+            | UiToDaemon::BlacklistDevice { message_id, .. }
+            | UiToDaemon::UnblacklistDevice { message_id, .. }
+            | UiToDaemon::ImportKeys { message_id, .. }
+            | UiToDaemon::ExportKeys { message_id, .. }
+            | UiToDaemon::StartSas { message_id, .. }
+            | UiToDaemon::CancelSas { message_id, .. }
+            | UiToDaemon::ConfirmSas { message_id, .. }
+            | UiToDaemon::AcceptSas { message_id, .. }
+            | UiToDaemon::ContinueKeyShare { message_id, .. }
+            | UiToDaemon::CancelKeyShare { message_id, .. } => message_id,
+        }
+    }
 }

@@ -258,6 +258,21 @@ async fn main() -> Result<()> {
 }
 
 async fn run(cmd: Cmd, conn: &Connection) -> Result<()> {
+    // D-Bus only delivers broadcast signals to connections that have registered
+    // a match rule.  Without this, MessageStream::from(conn) never receives
+    // signals emitted by pantalaimon (including Response), and every panctl
+    // command that waits for a response will time out.
+    let fdo = zbus::fdo::DBusProxy::new(conn)
+        .await
+        .context("Cannot connect to org.freedesktop.DBus")?;
+    let rule = zbus::MatchRule::builder()
+        .msg_type(zbus::message::Type::Signal)
+        .sender("org.pantalaimon1")?
+        .build();
+    fdo.add_match_rule(rule)
+        .await
+        .context("Failed to register signal match rule")?;
+
     let ctrl = ControlProxy::new(conn).await?;
     let devs = DevicesProxy::new(conn).await?;
 
@@ -306,56 +321,70 @@ async fn run(cmd: Cmd, conn: &Connection) -> Result<()> {
         }
 
         Cmd::VerifyDevice { pan_user, user_id, device_id } => {
+            let mut stream = zbus::MessageStream::from(conn);
             let mid = devs.verify_device(&pan_user, &user_id, &device_id).await?;
-            wait_response(conn, &mid).await?;
+            wait_response(&mut stream, &mid).await?;
         }
 
         Cmd::UnverifyDevice { pan_user, user_id, device_id } => {
+            let mut stream = zbus::MessageStream::from(conn);
             let mid = devs.unverify_device(&pan_user, &user_id, &device_id).await?;
-            wait_response(conn, &mid).await?;
+            wait_response(&mut stream, &mid).await?;
         }
 
         Cmd::BlacklistDevice { pan_user, user_id, device_id } => {
+            let mut stream = zbus::MessageStream::from(conn);
             let mid = devs.blacklist_device(&pan_user, &user_id, &device_id).await?;
-            wait_response(conn, &mid).await?;
+            wait_response(&mut stream, &mid).await?;
         }
 
         Cmd::UnblacklistDevice { pan_user, user_id, device_id } => {
+            let mut stream = zbus::MessageStream::from(conn);
             let mid = devs.unblacklist_device(&pan_user, &user_id, &device_id).await?;
-            wait_response(conn, &mid).await?;
+            wait_response(&mut stream, &mid).await?;
         }
 
         Cmd::StartVerification { pan_user, user_id, device_id } => {
+            // Create the stream before the D-Bus call so no signals are missed.
+            let mut stream = zbus::MessageStream::from(conn);
             let mid = ctrl.start_sas(&pan_user, &user_id, &device_id).await?;
             println!("SAS verification initiated (message_id={mid})");
-            println!("Waiting for the remote device to accept...");
-            wait_sas_show(conn, &pan_user, &user_id, &device_id).await?;
+            // Confirm the to-device request was actually sent before waiting for emoji.
+            wait_response(&mut stream, &mid).await?;
+            println!("Request sent. Waiting for the remote device to accept...");
+            wait_sas_show(&mut stream, &pan_user, &user_id, &device_id).await?;
         }
 
         Cmd::AcceptVerification { pan_user, user_id, device_id } => {
+            let mut stream = zbus::MessageStream::from(conn);
             let mid = ctrl.accept_sas(&pan_user, &user_id, &device_id).await?;
             println!("SAS accept sent (message_id={mid})");
-            wait_sas_show(conn, &pan_user, &user_id, &device_id).await?;
+            wait_response(&mut stream, &mid).await?;
+            wait_sas_show(&mut stream, &pan_user, &user_id, &device_id).await?;
         }
 
         Cmd::ConfirmVerification { pan_user, user_id, device_id } => {
+            let mut stream = zbus::MessageStream::from(conn);
             let mid = ctrl.confirm_sas(&pan_user, &user_id, &device_id).await?;
-            wait_response(conn, &mid).await?;
+            wait_response(&mut stream, &mid).await?;
         }
 
         Cmd::CancelVerification { pan_user, user_id, device_id } => {
+            let mut stream = zbus::MessageStream::from(conn);
             let mid = ctrl.cancel_sas(&pan_user, &user_id, &device_id).await?;
-            wait_response(conn, &mid).await?;
+            wait_response(&mut stream, &mid).await?;
         }
 
         Cmd::ImportKeys { pan_user, file_path, passphrase } => {
+            let mut stream = zbus::MessageStream::from(conn);
             let mid = ctrl.import_keys(&pan_user, &file_path, &passphrase).await?;
-            wait_response(conn, &mid).await?;
+            wait_response(&mut stream, &mid).await?;
         }
 
         Cmd::ExportKeys { pan_user, file_path, passphrase } => {
+            let mut stream = zbus::MessageStream::from(conn);
             let mid = ctrl.export_keys(&pan_user, &file_path, &passphrase).await?;
-            wait_response(conn, &mid).await?;
+            wait_response(&mut stream, &mid).await?;
         }
 
         Cmd::SendAnyways { pan_user, room_id } => {
@@ -371,13 +400,15 @@ async fn run(cmd: Cmd, conn: &Connection) -> Result<()> {
         }
 
         Cmd::ContinueKeyshare { pan_user, user_id, device_id } => {
+            let mut stream = zbus::MessageStream::from(conn);
             let mid = ctrl.continue_key_share(&pan_user, &user_id, &device_id).await?;
-            wait_response(conn, &mid).await?;
+            wait_response(&mut stream, &mid).await?;
         }
 
         Cmd::CancelKeyshare { pan_user, user_id, device_id } => {
+            let mut stream = zbus::MessageStream::from(conn);
             let mid = ctrl.cancel_key_share(&pan_user, &user_id, &device_id).await?;
-            wait_response(conn, &mid).await?;
+            wait_response(&mut stream, &mid).await?;
         }
     }
 
@@ -388,11 +419,12 @@ async fn run(cmd: Cmd, conn: &Connection) -> Result<()> {
 // Signal helpers
 // ---------------------------------------------------------------------------
 
-const SIGNAL_TIMEOUT_SECS: u64 = 30;
+// SAS verification requires the remote to accept and exchange keys — two sync
+// cycles minimum, each up to ~30s on a long-polling homeserver.
+const SIGNAL_TIMEOUT_SECS: u64 = 120;
 
 /// Wait for a `Response` signal matching `message_id` and print the result.
-async fn wait_response(conn: &Connection, message_id: &str) -> Result<()> {
-    let mut stream = zbus::MessageStream::from(conn);
+async fn wait_response(stream: &mut zbus::MessageStream, message_id: &str) -> Result<()> {
     let deadline =
         tokio::time::Instant::now() + tokio::time::Duration::from_secs(SIGNAL_TIMEOUT_SECS);
 
@@ -425,11 +457,10 @@ async fn wait_response(conn: &Connection, message_id: &str) -> Result<()> {
             continue;
         }
 
-        if code == "ok" {
+        if code == "M_OK" {
             println!("OK: {message}");
         } else {
-            eprintln!("Error ({code}): {message}");
-            std::process::exit(1);
+            anyhow::bail!("{code}: {message}");
         }
         return Ok(());
     }
@@ -437,12 +468,11 @@ async fn wait_response(conn: &Connection, message_id: &str) -> Result<()> {
 
 /// Wait for a `SasShow` signal and print the emoji list so the user can compare.
 async fn wait_sas_show(
-    conn: &Connection,
+    stream: &mut zbus::MessageStream,
     pan_user: &str,
     user_id: &str,
     device_id: &str,
 ) -> Result<()> {
-    let mut stream = zbus::MessageStream::from(conn);
     let deadline =
         tokio::time::Instant::now() + tokio::time::Duration::from_secs(SIGNAL_TIMEOUT_SECS);
 
