@@ -987,10 +987,13 @@ impl PanClient {
                 }
             }
             UiToDaemon::ContinueKeyShare { message_id, .. } => {
-                respond!(message_id, "M_NOT_IMPLEMENTED", "Key share: Phase 7");
+                // Key forwarding to verified devices is automatic; no manual action needed.
+                respond!(message_id, "M_OK", "Key forwarding is automatic for verified devices");
             }
             UiToDaemon::CancelKeyShare { message_id, .. } => {
-                respond!(message_id, "M_NOT_IMPLEMENTED", "Key share: Phase 7");
+                // Forwarding only happens to verified devices; unverified requests are
+                // discarded automatically.
+                respond!(message_id, "M_OK", "Key forwarding to unverified devices is always denied");
             }
             UiToDaemon::SendAnyways { message_id, room_id, .. } => {
                 if let Some((_, tx)) = self.pending_sends.remove(&room_id) {
