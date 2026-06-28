@@ -432,8 +432,8 @@ impl PanClient {
         let ruma_room_id = RoomId::parse(room_id)?;
         let users = self.get_room_member_ids(&ruma_room_id).await?;
 
-        // Block if any room member has unverified devices
-        if self.has_unverified_devices(&users).await {
+        // Block if any room member has unverified devices (unless config says ignore)
+        if !self.server_conf.ignore_verification && self.has_unverified_devices(&users).await {
             if self.pending_sends.contains_key(room_id) {
                 anyhow::bail!("another send is already pending for room {room_id}");
             }
@@ -516,7 +516,7 @@ impl PanClient {
     }
 
     /// Returns true if any room member (other than ourselves) has a device
-    /// with `LocalTrust::Unset` (never reviewed).
+    /// that is not verified (neither manually nor via cross-signing).
     async fn has_unverified_devices(&self, users: &[OwnedUserId]) -> bool {
         for user_id in users {
             if user_id.as_str() == self.user_id {
@@ -524,7 +524,14 @@ impl PanClient {
             }
             if let Ok(devices) = self.olm.get_user_devices(user_id, None).await {
                 for device in devices.devices() {
-                    if device.local_trust_state() == LocalTrust::Unset {
+                    if !device.is_verified() {
+                        debug!(
+                            %user_id,
+                            device_id = %device.device_id(),
+                            local_trust = ?device.local_trust_state(),
+                            cross_signing = device.is_cross_signing_trusted(),
+                            "blocking send: unverified device"
+                        );
                         return true;
                     }
                 }
@@ -1063,9 +1070,21 @@ impl PanClient {
         device_id: &str,
     ) -> Result<()> {
         let uid = UserId::parse(user_id)?;
-        let request = self
-            .olm
-            .get_verification_requests(&uid)
+        let all_requests = self.olm.get_verification_requests(&uid);
+        debug!(
+            %user_id,
+            count = all_requests.len(),
+            requests = ?all_requests.iter().map(|r| format!(
+                "flow={} device={:?} done={} cancelled={} we_started={}",
+                r.flow_id().as_str(),
+                r.other_device_id(),
+                r.is_done(),
+                r.is_cancelled(),
+                r.we_started(),
+            )).collect::<Vec<_>>(),
+            "accept-sas: verification requests in OlmMachine"
+        );
+        let request = all_requests
             .into_iter()
             .find(|r| {
                 r.other_device_id()
@@ -1309,7 +1328,11 @@ impl PanClient {
         };
 
         for event in &events {
-            if event.get("type").and_then(|t| t.as_str()) != Some("m.key.verification.request") {
+            let event_type = event.get("type").and_then(|t| t.as_str()).unwrap_or("");
+            if event_type.starts_with("m.key.verification") {
+                debug!(event_type, "to-device verification event received");
+            }
+            if event_type != "m.key.verification.request" {
                 continue;
             }
             let sender = match event.get("sender").and_then(|s| s.as_str()) {
@@ -1435,7 +1458,7 @@ impl PanClient {
                     })
                     .await;
                 }
-                to_remove.push(key);
+                to_remove.push((key, sas.flow_id().as_str().to_owned()));
                 continue;
             }
 
@@ -1463,9 +1486,11 @@ impl PanClient {
             }
         }
 
-        for key in to_remove {
+        for (key, flow_id) in to_remove {
             self.active_sas.remove(&key);
+            self.notified_show.remove(&key);
             self.notified_done.remove(&key);
+            self.notified_invite.remove(&flow_id);
         }
     }
 
@@ -1581,9 +1606,10 @@ impl PanClient {
                 .devices()
                 .map(|d| {
                     let trust_state = match d.local_trust_state() {
-                        LocalTrust::Verified => "verified",
                         LocalTrust::BlackListed => "blacklisted",
                         LocalTrust::Ignored => "ignored",
+                        LocalTrust::Verified => "verified",
+                        LocalTrust::Unset if d.is_cross_signing_trusted() => "cross-signing-verified",
                         LocalTrust::Unset => "unset",
                     };
                     HashMap::from([

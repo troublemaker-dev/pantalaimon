@@ -127,7 +127,9 @@ pub fn read_config(path: &Path) -> anyhow::Result<PanConfig> {
             .transpose()
             .with_context(|| format!("[{}] Invalid Proxy URL", section))?;
 
-        let ssl = get_bool(&section, "SSL")?.unwrap_or(true);
+        let ssl = get_bool(&section, "UseSSL")?
+            .or(get_bool(&section, "SSL")?)
+            .unwrap_or(true);
         let ignore_verification = get_bool(&section, "IgnoreVerification")?.unwrap_or(false);
         let use_keyring = get_bool(&section, "UseKeyring")?.unwrap_or(true);
         let search_requests = get_bool(&section, "SearchRequests")?.unwrap_or(false);

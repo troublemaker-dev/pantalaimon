@@ -19,9 +19,15 @@ pub enum AppError {
 impl IntoResponse for AppError {
     fn into_response(self) -> Response {
         let status = match &self {
-            AppError::Upstream(_) => StatusCode::BAD_GATEWAY,
+            AppError::Upstream(e) => {
+                tracing::error!(cause = ?e, "upstream request failed");
+                StatusCode::BAD_GATEWAY
+            }
             AppError::Body => StatusCode::BAD_REQUEST,
-            AppError::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
+            AppError::Internal(e) => {
+                tracing::error!(cause = ?e, "internal error");
+                StatusCode::INTERNAL_SERVER_ERROR
+            }
         };
         let body = Json(serde_json::json!({
             "errcode": "M_UNKNOWN",
