@@ -762,4 +762,72 @@ mod tests {
         let tasks = store.load_fetcher_tasks("local", "@alice:localhost").await.unwrap();
         assert!(tasks.is_empty());
     }
+
+    #[tokio::test]
+    async fn test_fetcher_task_multiple() {
+        let (store, _dir) = make_store().await;
+        let t1 = FetchTask { room_id: "!room1:localhost".to_owned(), token: "a".to_owned() };
+        let t2 = FetchTask { room_id: "!room2:localhost".to_owned(), token: "b".to_owned() };
+        store.save_fetcher_task("local", "@alice:localhost", &t1).await.unwrap();
+        store.save_fetcher_task("local", "@alice:localhost", &t2).await.unwrap();
+        let tasks = store.load_fetcher_tasks("local", "@alice:localhost").await.unwrap();
+        assert_eq!(tasks.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_load_all_tokens() {
+        let (store, _dir) = make_store().await;
+        store.save_access_token("@alice:localhost", "D1", "tok_a").await.unwrap();
+        store.save_access_token("@bob:localhost", "D2", "tok_b").await.unwrap();
+        let all = store.load_all_tokens().await.unwrap();
+        assert_eq!(all.len(), 2);
+        let user_ids: Vec<&str> = all.iter().map(|(u, _, _)| u.as_str()).collect();
+        assert!(user_ids.contains(&"@alice:localhost"));
+        assert!(user_ids.contains(&"@bob:localhost"));
+    }
+
+    #[tokio::test]
+    async fn test_session_tokens_multiple_users() {
+        let (store, _dir) = make_store().await;
+        store.save_server_user("local", "@alice:localhost").await.unwrap();
+        store.save_server_user("local", "@bob:localhost").await.unwrap();
+        store.save_access_token("@alice:localhost", "D1", "tok_a").await.unwrap();
+        store.save_access_token("@bob:localhost", "D2", "tok_b").await.unwrap();
+        let rows = store.load_session_tokens("local").await.unwrap();
+        assert_eq!(rows.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_media_server_isolation() {
+        let (store, _dir) = make_store().await;
+        let key = serde_json::json!({"kty":"oct","k":"AAAA","alg":"A256CTR","ext":true});
+        let hashes = serde_json::json!({"sha256":"abc"});
+        let media = MediaInfo {
+            mxc_server: "matrix.org".to_owned(),
+            mxc_path: "file1".to_owned(),
+            key: key.clone(),
+            iv: "AAAA".to_owned(),
+            hashes: hashes.clone(),
+        };
+        store.save_media("server_a", &media).await.unwrap();
+
+        // Same mxc URI stored under a different pan-server name — should not be found
+        let not_found = store.load_media("server_b", "matrix.org", "file1").await.unwrap();
+        assert!(not_found.is_none());
+
+        let found = store.load_media("server_a", "matrix.org", "file1").await.unwrap();
+        assert!(found.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_upload_idempotent() {
+        // save_upload uses INSERT OR IGNORE — a second call for the same URI is a no-op.
+        let (store, _dir) = make_store().await;
+        store.save_upload("local", "mxc://h/f1", "original.jpg", "image/jpeg").await.unwrap();
+        store.save_upload("local", "mxc://h/f1", "renamed.jpg", "image/png").await.unwrap();
+        let got = store.load_upload("local", "mxc://h/f1").await.unwrap().unwrap();
+        // Second write is ignored; first row is preserved.
+        assert_eq!(got.filename, "original.jpg");
+        assert_eq!(got.mimetype, "image/jpeg");
+    }
 }

@@ -518,3 +518,126 @@ async fn test_search_disabled_returns_404() {
     let body = body_json(resp).await;
     assert_eq!(body["errcode"], "M_NOT_FOUND");
 }
+
+/// When search_requests is enabled, the search endpoint is forwarded to the homeserver.
+#[tokio::test]
+async fn test_search_enabled_forwards_to_homeserver() {
+    let mock = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/_matrix/client/v3/search"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"search_categories": {}})))
+        .mount(&mock)
+        .await;
+
+    let dir = TempDir::new().unwrap();
+    let store = Arc::new(PanStore::new(dir.path()).await.unwrap());
+    let mut conf = server_conf(&mock.uri());
+    conf.search_requests = true;
+    let daemon = ProxyDaemon::new(conf, store, dir.path().to_path_buf(), None).await.unwrap();
+    let router = build_router(daemon);
+
+    let req = Request::builder()
+        .method("POST")
+        .uri("/_matrix/client/v3/search")
+        .header("content-type", "application/json")
+        .body(Body::from(json!({"search_categories": {}}).to_string()))
+        .unwrap();
+    let resp = router.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), 200);
+}
+
+/// The /messages endpoint (paginated history) is forwarded and the response returned.
+/// Encrypted events that can't be decrypted (no session) pass through as-is.
+#[tokio::test]
+async fn test_messages_endpoint_proxied() {
+    let mock = MockServer::start().await;
+    mount_crypto_noise(&mock).await;
+
+    let (router, _store, _dir) = make_router(&mock).await;
+    let router = do_login(router, &mock).await;
+
+    Mock::given(method("GET"))
+        .and(path("/_matrix/client/v3/rooms/!testroom:localhost/messages"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "chunk": [
+                {"type": "m.room.message", "content": {"msgtype": "m.text", "body": "hello"}, "event_id": "$e1:h"}
+            ],
+            "start": "t1",
+            "end": "t2"
+        })))
+        .mount(&mock)
+        .await;
+
+    let req = Request::builder()
+        .uri("/_matrix/client/v3/rooms/!testroom:localhost/messages?dir=b&limit=20")
+        .header("Authorization", "Bearer syt_test_token")
+        .body(Body::empty())
+        .unwrap();
+    let resp = router.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), 200);
+    let body = body_json(resp).await;
+    assert_eq!(body["chunk"][0]["type"], "m.room.message");
+}
+
+/// The r0 sync route behaves identically to v3.
+#[tokio::test]
+async fn test_sync_r0_route_works() {
+    let mock = MockServer::start().await;
+    mount_crypto_noise(&mock).await;
+
+    let (router, _store, _dir) = make_router(&mock).await;
+    let router = do_login(router, &mock).await;
+
+    Mock::given(method("GET"))
+        .and(path("/_matrix/client/r0/sync"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(basic_sync_json()))
+        .mount(&mock)
+        .await;
+
+    let req = Request::builder()
+        .uri("/_matrix/client/r0/sync?since=s1&timeout=0")
+        .header("Authorization", "Bearer syt_test_token")
+        .body(Body::empty())
+        .unwrap();
+    let resp = router.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), 200);
+}
+
+/// IgnoreVerification flag is plumbed through to the server config.
+#[tokio::test]
+async fn test_ignore_verification_config_propagated() {
+    let mock = MockServer::start().await;
+    let dir = TempDir::new().unwrap();
+    let store = Arc::new(PanStore::new(dir.path()).await.unwrap());
+    let mut conf = server_conf(&mock.uri());
+    conf.ignore_verification = true;
+    let daemon =
+        ProxyDaemon::new(conf.clone(), store, dir.path().to_path_buf(), None).await.unwrap();
+    // Verify the flag is on the daemon's server config.
+    assert!(daemon.server_conf.ignore_verification);
+}
+
+/// Download with a three-segment path (server/id/filename) resolves correctly.
+#[tokio::test]
+async fn test_download_with_filename_segment_proxied() {
+    let mock = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/_matrix/media/v3/download/matrix.org/abc123/photo.jpg"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .append_header("content-type", "image/jpeg")
+                .set_body_bytes(b"jpeg data".to_vec()),
+        )
+        .mount(&mock)
+        .await;
+
+    let (router, _store, _dir) = make_router(&mock).await;
+    let req = Request::builder()
+        .uri("/_matrix/media/v3/download/matrix.org/abc123/photo.jpg")
+        .body(Body::empty())
+        .unwrap();
+    let resp = router.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), 200);
+    let bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+    assert_eq!(&bytes[..], b"jpeg data");
+}

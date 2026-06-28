@@ -1759,4 +1759,34 @@ mod tests {
         assert_eq!(second, 0, "second prune should find nothing to delete");
         assert_eq!(count_sessions(f.path()), 1);
     }
+
+    #[tokio::test]
+    async fn test_encrypt_decrypt_attachment_roundtrip() {
+        let plaintext = b"the quick brown fox jumps over the lazy dog";
+        let (ciphertext, info) =
+            PanClient::encrypt_attachment(bytes::Bytes::from_static(plaintext))
+                .await
+                .unwrap();
+
+        assert_ne!(ciphertext.as_ref(), plaintext, "ciphertext must differ from plaintext");
+
+        let recovered = PanClient::decrypt_attachment(ciphertext, info).await.unwrap();
+        assert_eq!(recovered.as_ref(), plaintext);
+    }
+
+    #[tokio::test]
+    async fn test_encrypt_attachment_empty() {
+        let (ciphertext, info) = PanClient::encrypt_attachment(bytes::Bytes::new()).await.unwrap();
+        let recovered = PanClient::decrypt_attachment(ciphertext, info).await.unwrap();
+        assert!(recovered.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_encrypt_attachment_different_keys_each_call() {
+        let data = bytes::Bytes::from_static(b"same input");
+        let (ct1, _) = PanClient::encrypt_attachment(data.clone()).await.unwrap();
+        let (ct2, _) = PanClient::encrypt_attachment(data).await.unwrap();
+        // Each encryption uses a fresh random IV/key so ciphertexts should differ.
+        assert_ne!(ct1, ct2);
+    }
 }

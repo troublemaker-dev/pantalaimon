@@ -288,4 +288,126 @@ mod tests {
         let cfg = read_config(f.path()).unwrap();
         assert!(cfg.servers.is_empty());
     }
+
+    #[test]
+    fn test_use_ssl_alias() {
+        // UseSSL and SSL are both accepted; UseSSL takes precedence.
+        let f = write_config(
+            "[Local]\n\
+             Homeserver = http://localhost:8448\n\
+             UseSSL = false\n",
+        );
+        let cfg = read_config(f.path()).unwrap();
+        assert!(!cfg.servers["Local"].ssl);
+
+        // SSL (old key) also works
+        let f2 = write_config(
+            "[Local]\n\
+             Homeserver = http://localhost:8448\n\
+             SSL = false\n",
+        );
+        let cfg2 = read_config(f2.path()).unwrap();
+        assert!(!cfg2.servers["Local"].ssl);
+    }
+
+    #[test]
+    fn test_proxy_url_parsed() {
+        let f = write_config(
+            "[Local]\n\
+             Homeserver = http://localhost:8448\n\
+             Proxy = http://squid.internal:3128\n",
+        );
+        let cfg = read_config(f.path()).unwrap();
+        let proxy = cfg.servers["Local"].proxy.as_ref().unwrap();
+        assert_eq!(proxy.host_str(), Some("squid.internal"));
+        assert_eq!(proxy.port(), Some(3128));
+    }
+
+    #[test]
+    fn test_invalid_proxy_url_errors() {
+        let f = write_config(
+            "[Local]\n\
+             Homeserver = http://localhost:8448\n\
+             Proxy = not-a-url\n",
+        );
+        assert!(read_config(f.path()).is_err());
+    }
+
+    #[test]
+    fn test_indexing_batch_size_bounds() {
+        let too_small = write_config(
+            "[Local]\n\
+             Homeserver = http://localhost:8448\n\
+             IndexingBatchSize = 1\n",
+        );
+        assert!(read_config(too_small.path()).is_err());
+
+        let too_large = write_config(
+            "[Local]\n\
+             Homeserver = http://localhost:8448\n\
+             IndexingBatchSize = 1001\n",
+        );
+        assert!(read_config(too_large.path()).is_err());
+    }
+
+    #[test]
+    fn test_history_fetch_delay_bounds() {
+        let too_small = write_config(
+            "[Local]\n\
+             Homeserver = http://localhost:8448\n\
+             HistoryFetchDelay = 100\n",
+        );
+        assert!(read_config(too_small.path()).is_err());
+
+        let too_large = write_config(
+            "[Local]\n\
+             Homeserver = http://localhost:8448\n\
+             HistoryFetchDelay = 10001\n",
+        );
+        assert!(read_config(too_large.path()).is_err());
+    }
+
+    #[test]
+    fn test_history_fetch_delay_ms_to_seconds() {
+        let f = write_config(
+            "[Local]\n\
+             Homeserver = http://localhost:8448\n\
+             HistoryFetchDelay = 5000\n",
+        );
+        let cfg = read_config(f.path()).unwrap();
+        assert!((cfg.servers["Local"].history_fetch_delay - 5.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_global_debug_encryption_and_notifications() {
+        let f = write_config(
+            "[Default]\n\
+             DebugEncryption = true\n\
+             Notifications = false\n\
+             \n\
+             [Local]\n\
+             Homeserver = http://localhost:8448\n",
+        );
+        let cfg = read_config(f.path()).unwrap();
+        assert!(cfg.debug_encryption);
+        assert!(!cfg.notifications);
+    }
+
+    #[test]
+    fn test_drop_old_keys_default_false() {
+        let f = write_config("[Local]\nHomeserver = http://localhost:8448\n");
+        let cfg = read_config(f.path()).unwrap();
+        assert!(!cfg.servers["Local"].drop_old_keys);
+    }
+
+    #[test]
+    fn test_drop_old_keys_enabled() {
+        let f = write_config(
+            "[Local]\n\
+             Homeserver = http://localhost:8448\n\
+             DropOldKeys = true\n",
+        );
+        let cfg = read_config(f.path()).unwrap();
+        assert!(cfg.servers["Local"].drop_old_keys);
+    }
 }
