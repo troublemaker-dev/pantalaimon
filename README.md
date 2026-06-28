@@ -179,6 +179,36 @@ panctl export-keys @alice:example.com /path/to/keys.txt passphrase
 panctl import-keys @alice:example.com /path/to/keys.txt passphrase
 ```
 
+## Running as a systemd service
+
+### Native binary (Linux)
+
+```bash
+cp contrib/pantalaimon.service ~/.config/systemd/user/
+systemctl --user daemon-reload
+systemctl --user enable --now pantalaimon
+```
+
+The service file uses `%h` to expand to your home directory. The binary is expected at `/usr/local/bin/pantalaimon`; adjust `ExecStart` if you installed elsewhere.
+
+### Container via Podman Quadlet (Podman 4.4+)
+
+Quadlet generates a systemd service from a `.container` file — no `podman run` command needed.
+
+```bash
+cp contrib/pantalaimon.container ~/.config/containers/systemd/
+systemctl --user daemon-reload
+systemctl --user start pantalaimon
+```
+
+Edit the file to set the correct image name (matching what you passed to `podman build -t`) and any additional `PublishPort` entries for your config.
+
+Use panctl via exec:
+
+```bash
+podman exec -it pantalaimon panctl <command>
+```
+
 ## panctl command reference
 
 | Command | Description |
