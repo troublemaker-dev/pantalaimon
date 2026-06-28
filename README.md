@@ -1,188 +1,203 @@
 pantalaimon
 ===========
 
-Pantalaimon is an end-to-end encryption aware Matrix reverse proxy daemon.
-Pantalaimon acts as a good man in the middle that handles the encryption for you.
-
-Messages are transparently encrypted and decrypted for clients inside of
-pantalaimon.
+Pantalaimon is an end-to-end encryption aware Matrix reverse proxy daemon. It sits between a Matrix client and a homeserver, transparently encrypting outgoing messages and decrypting incoming ones. Clients connect to pantalaimon as if it were the homeserver; all crypto is handled internally using [Vodozemac](https://github.com/matrix-org/vodozemac) via matrix-sdk-crypto.
 
 ![Pantalaimon in action](docs/pan.gif)
 
-Installation
-============
+## Running
 
-The [Olm](https://gitlab.matrix.org/matrix-org/olm) C library is required to
-be installed before installing pantalaimon.
+### Container (recommended, required on macOS)
 
-If your distribution provides packages for libolm it is best to use those, note
-that a recent version of libolm is required (3.1+). If your distribution doesn't
-provide a package building from source is required. Please refer to the Olm
-[readme](https://gitlab.matrix.org/matrix-org/olm/blob/master/README.md)
-to see how to build the C library from source.
-
-Installing pantalaimon works like usually with python packages:
-
-    python setup.py install
-
-or you can use `pip` and install it with:
-```
-pip install .[ui]
-```
-
-It is recommended that you create a virtual environment first or install dependencies
-via your package manager. They are usually found with `python-<package-name>`.
-
-Pantalaimon can also be found on pypi:
-
-    pip install pantalaimon
-
-Pantalaimon contains a dbus based UI that can be used to control the daemon.
-The dbus based UI is completely optional and needs to be installed with the
-daemon:
-
-    pip install pantalaimon[ui]
-
-Do note that man pages can't be installed with pip.
-
-### macOS installation
-
-For instance, on macOS, this means:
+pantalaimon depends on D-Bus for the `panctl` control interface, which is Linux-only. The container is the recommended approach on macOS and any system where you don't want to install D-Bus natively.
 
 ```bash
-brew install dbus
-perl -pi -e's#(<auth>EXTERNAL</auth>)#<!--$1-->#' $(brew --prefix dbus)/share/dbus-1/session.conf
-brew services start dbus
-# it may be necessary to restart now to get the whole OS to pick up the
-# existence of the dbus daemon
-
-git clone https://gitlab.matrix.org/matrix-org/olm
-(cd olm; make)
-git clone https://github.com/matrix-org/pantalaimon
-(cd pantalaimon; CFLAGS=-I../olm/include LDFLAGS=-L../olm/build/ python3 setup.py install)
-
-export DBUS_SESSION_BUS_ADDRESS=unix:path=$(launchctl getenv DBUS_LAUNCHD_SESSION_BUS_SOCKET)
-cd pantalaimon
-DYLD_LIBRARY_PATH=../olm/build/ pantalaimon -c contrib/pantalaimon.conf
-
-# for notification center:
-git clone https://github.com/fakechris/notification-daemon-mac-py
-# if you have django's `foundation` library installed and your filesystem
-# is case insensitive (the default) then you will need to `pip uninstall foundation`
-# or install PyObjC in a venv...
-pip install PyObjC daemon glib dbus-python
-cd notification-daemon-mac-py
-./notify.py
+podman build -t pantalaimon .
 ```
-
-### Docker
-
-An experimental Docker image can be built for Pantalaimon, primarily for use in bots.
 
 ```bash
-docker build -t pantalaimon .
-# Create a pantalaimon.conf before running. The directory mentioned in the
-# volume below is for where Pantalaimon should dump some data.
-docker run -it --rm -v /path/to/pantalaimon/dir:/data -p 8008:8008 pantalaimon
-```
-The Docker image in the above example can alternatively be built straight from any branch or tag without the need to clone the repo, just by using this syntax:
-```bash
-docker build -t pantalaimon github.com/matrix-org/pantalaimon#master
+podman run -it --rm \
+  --name pantalaimon \
+  -v ~/.local/share/pantalaimon:/data \
+  -v ~/.config/pantalaimon:/config \
+  --publish 8009:8009 \
+  -e RUST_LOG=pantalaimon=info \
+  pantalaimon \
+  -c /config/pantalaimon.conf --data-path /data
 ```
 
-An example `pantalaimon.conf` for Docker is:
-```conf
+Use `panctl` inside the running container:
+
+```bash
+podman exec -it pantalaimon panctl <command>
+```
+
+### Local (Linux)
+
+```bash
+cargo build --release --features ui --bin pantalaimon --bin panctl
+```
+
+```bash
+RUST_LOG=pantalaimon=info ./target/release/pantalaimon -c ~/.config/pantalaimon/pantalaimon.conf
+```
+
+```bash
+./target/release/panctl <command>
+```
+
+### Local without D-Bus (any platform, no panctl)
+
+```bash
+cargo build --release --bin pantalaimon
+RUST_LOG=pantalaimon=info ./target/release/pantalaimon -c ~/.config/pantalaimon/pantalaimon.conf
+```
+
+Device management commands are unavailable without `panctl`. Use `IgnoreVerification = True` in the config if you don't need device verification.
+
+## Configuration
+
+The config file uses INI format with a `[Default]` section and one section per homeserver proxy.
+
+```ini
 [Default]
-LogLevel = Debug
-SSL = True
+LogLevel = Info
 
-[local-matrix]
-Homeserver = https://matrix.org
-ListenAddress = 0.0.0.0
-ListenPort = 8008
-SSL = False
-UseKeyring = False
-IgnoreVerification = True
-```
-
-Usage
-=====
-
-While pantalaimon is a daemon, it is meant to be run as the same user as the app it is proxying for. It won't
-verify devices for you automatically, unless configured to do so, and requires
-user interaction to verify, ignore or blacklist devices. A more complete
-description of Pantalaimon can be found in the [man page](docs/man/pantalaimon.8.md).
-
-Pantalaimon requires a configuration file to run. The configuration file
-specifies one or more homeservers for pantalaimon to connect to.
-
-A minimal pantalaimon configuration looks like this:
-```dosini
-[local-matrix]
-Homeserver = https://localhost:443
+[my-server]
+Homeserver = https://matrix.example.com
 ListenAddress = localhost
 ListenPort = 8009
+UseKeyring = True
 ```
 
-The configuration file should be placed in `~/.config/pantalaimon/pantalaimon.conf`.
+Place it at `~/.config/pantalaimon/pantalaimon.conf` or pass `-c /path/to/pantalaimon.conf`.
 
-The full documentation for the pantalaimons configuration can be found in
-the [man page](docs/man/pantalaimon.5.md) `pantalaimon(5)`.
+### Config reference
 
-Now that pantalaimon is configured it can be run:
+| Key | Default | Description |
+|-----|---------|-------------|
+| `LogLevel` | `Warning` | `Error`, `Warning`, `Info`, or `Debug` |
+| `Homeserver` | *(required)* | URL of the upstream Matrix homeserver |
+| `ListenAddress` | `localhost` | Address pantalaimon listens on |
+| `ListenPort` | `8009` | Port pantalaimon listens on |
+| `UseSSL` | `True` | Whether the upstream homeserver uses HTTPS |
+| `UseKeyring` | `True` | Store access tokens in the OS keyring; set `False` in containers |
+| `IgnoreVerification` | `False` | Skip the unverified-device check on send; useful for bots |
+| `DropOldKeys` | `False` | Prune old inbound Megolm sessions on startup |
 
-    pantalaimon --log-level debug
+### Container config
 
-After running the daemon, configure your client to connect to the daemon instead
-of your homeserver. The daemon listens by default on localhost and port 8009.
+Use `0.0.0.0` for `ListenAddress` so the port is reachable from outside the container, and `False` for `UseKeyring` since there is no OS keyring inside the container (tokens are stored in the data volume's SQLite DB instead).
 
-Note that logging in to the daemon is required to start a sync loop for a user.
-After that clients can connect using any valid access token for the user that
-logged in. Multiple users per homeserver are supported.
+```ini
+[Default]
+LogLevel = Info
 
-For convenience a systemd service file is provided.
+[my-server]
+Homeserver = https://matrix.example.com
+ListenAddress = 0.0.0.0
+ListenPort = 8009
+UseKeyring = False
+```
 
-To control the daemon an interactive utility is provided in the form of
-`panctl`.
+If the homeserver is running on the host machine, use `host.containers.internal` (Podman) or `host-gateway` (Docker) instead of `localhost`:
 
-`panctl` can be used to verify, blacklist or ignore devices, import or export
-session keys, or to introspect devices of users that we share encrypted rooms
-with.
+```ini
+Homeserver = http://host.containers.internal:8448/
+UseSSL = False
+```
 
-### Setup
-This is all coming from an excellent comment that you can find [here](https://github.com/matrix-org/pantalaimon/issues/154#issuecomment-1951591191).
+### Data directory
 
+Crypto stores and the token database are written to `$XDG_DATA_HOME/pantalaimon` by default (`~/.local/share/pantalaimon` on most Linux systems). Override with `--data-path /path/to/dir`. In the container, mount this directory as a volume so state persists across restarts.
 
+## Usage
 
-1) Ensure you have an OS keyring installed. In my case I installed `gnome-keyring`. You may also want a GUI like `seahorse` to inspect the keyring. (pantalaimon will work without a keyring but your client will have to log in with the password every time `pantalaimon` is restarted, instead of being able to reuse the access token from the previous successful login.)
+1. Start pantalaimon.
+2. Point your Matrix client at pantalaimon's `ListenAddress:ListenPort` instead of your homeserver.
+3. Log in with your normal Matrix credentials — pantalaimon captures the session and handles all encryption from that point on.
 
-2) In case you have prior attempts, clean the slate by deleting the `~/.local/share/pantalaimon` directory.
+Multiple clients can connect using the same access token once one has logged in. Multiple users per homeserver are supported.
 
-3) Start `pantalaimon`.
+## Device verification with panctl
 
-4) Connect a client to the `ListenAddress:ListenPort` you specified in `pantalaimon.conf`, eg to `127.0.0.1:8009`, using the same username and password you would've used to login to your homeserver directly.
+Before pantalaimon will encrypt messages to a room, all other participants' devices must be verified (or `IgnoreVerification = True` must be set). Use `panctl` to manage this.
 
-5) The login should succeed, but at this point all encrypted messages will fail to decrypt. This is fine.
+### List known devices for a user
 
-6) Start another client that you were already using for your encrypted chats previously. In my case this was `app.element.io`, so the rest of the steps here assume that.
+```
+panctl list-devices @alice:example.com @bob:example.com
+```
 
-7) Run `panctl`. At the prompt, run `start-verification <user ID> <user ID> <Element's device ID>`. `<user ID>` here is the full user ID like `@arnavion:arnavion.dev`. If you only have the one Element session, `panctl` will show you the device ID as an autocomplete hint so you don't have to look it up. If you do need to look it up, go to Element -> profile icon -> All Settings -> Sessions, expand the "Current session" item, and the "Session ID" is the device ID.
+Trust state is one of: `verified`, `cross-signing-verified`, `unset`, `blacklisted`, `ignored`.
 
-8) In Element you will see a popup "Incoming Verification Request". Click "Continue". It will change to a popup containing some emojis, and `panctl` will print the same emojis. Click the "They match" button. It will now change to a popup like "Waiting for other client to confirm..."
+### SAS emoji verification (recommended)
 
-9) In `panctl`, run `confirm-verification <user ID> <user ID> <Element's device ID>`, ie the same command as before but with `confirm-verification` instead of `start-verification`.
+Initiate from panctl and confirm in the other client:
 
-10) At this point, if you look at all your sessions in Element (profile icon -> All Settings -> Sessions), you should see "pantalaimon" in the "Other sessions" list as a "Verified" session.
+```
+panctl start-verification @alice:example.com @bob:example.com BOB_DEVICE_ID
+```
 
-11) Export the E2E room keys that Element was using via profile icon -> Security & Privacy -> Export E2E room keys. Pick any password and then save the file to some path.
+The other client will receive a verification request. Once accepted, both sides display matching emoji. Confirm in the other client first, then:
 
-12) Back in `panctl`, run `import-keys <user ID> <path of file> <password you used to encrypt the file>`. After a few seconds, in the output of `pantalaimon`, you should see a log like `INFO: pantalaimon: Successfully imported keys for <user ID> from <path of file>`.
+```
+panctl confirm-verification @alice:example.com @bob:example.com BOB_DEVICE_ID
+```
 
-13) Close and restart the client you had used in step 5, ie the one you want to connect to `pantalaimon`. Now, finally, you should be able to see the encrypted chats be decrypted.
+### Manual trust
 
-14) Delete the E2E room keys backup file from step 12. You don't need it any more.
+If cross-signing verification already happened in another client (e.g. between iamb and ement), pantalaimon recognises that trust automatically. If you want to bypass SAS entirely:
 
+```
+panctl verify-device @alice:example.com @bob:example.com BOB_DEVICE_ID
+```
 
-15) If in step 11 you had other unverified sessions from pantalaimon from your prior attempts, you can sign out of them too.
+### Handling a send blocked by unverified devices
 
-You will probably have to repeat steps 11-14 any time you start a new encrypted chat in Element.
+When pantalaimon blocks a send, it waits up to 30 seconds for a decision from panctl:
+
+```
+panctl send-anyways @alice:example.com ROOM_ID    # send despite unverified devices
+panctl cancel-sending @alice:example.com ROOM_ID  # cancel the send
+```
+
+### Restore cross-signing identity
+
+If your account has SSSS set up (Security Key in your client's settings):
+
+```
+panctl recover-identity @alice:example.com
+```
+
+Enter your security key or passphrase when prompted. This imports the cross-signing keys and uploads device signatures immediately.
+
+### Key import / export
+
+```
+panctl export-keys @alice:example.com /path/to/keys.txt passphrase
+panctl import-keys @alice:example.com /path/to/keys.txt passphrase
+```
+
+## panctl command reference
+
+| Command | Description |
+|---------|-------------|
+| `list-servers` | List configured homeserver proxies |
+| `list-users` | List logged-in sessions |
+| `list-devices <pan_user> <user_id>` | List known devices for a user |
+| `verify-device <pan_user> <user_id> <device_id>` | Manually mark a device as verified |
+| `unverify-device <pan_user> <user_id> <device_id>` | Remove manual verification |
+| `blacklist-device <pan_user> <user_id> <device_id>` | Never encrypt to this device |
+| `unblacklist-device <pan_user> <user_id> <device_id>` | Remove blacklist entry |
+| `start-verification <pan_user> <user_id> <device_id>` | Start SAS emoji verification |
+| `accept-verification <pan_user> <user_id> <device_id>` | Accept an incoming verification request |
+| `confirm-verification <pan_user> <user_id> <device_id>` | Confirm emoji match |
+| `cancel-verification <pan_user> <user_id> <device_id>` | Cancel verification in progress |
+| `send-anyways <pan_user> <room_id>` | Allow a blocked send |
+| `cancel-sending <pan_user> <room_id>` | Cancel a blocked send |
+| `recover-identity <pan_user>` | Restore cross-signing from SSSS |
+| `import-keys <pan_user> <file> <passphrase>` | Import E2E key backup |
+| `export-keys <pan_user> <file> <passphrase>` | Export E2E keys |
+
+`<pan_user>` is the full Matrix user ID of the session pantalaimon is managing (e.g. `@alice:example.com`).

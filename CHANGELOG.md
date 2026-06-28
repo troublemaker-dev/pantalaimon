@@ -4,6 +4,29 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## 0.11.0 — Rust rewrite
+
+Complete rewrite in Rust. The Python implementation and its libolm dependency have been removed.
+
+### Changed
+- Crypto backend replaced with [Vodozemac](https://github.com/matrix-org/vodozemac) via matrix-sdk-crypto; libolm is no longer required
+- D-Bus interface reimplemented with zbus
+- panctl reimplemented as a Rust CLI (clap + zbus)
+- Config file format unchanged; `UseSSL` accepted as alias for `SSL`
+- Data directory layout changed: crypto state is stored per-user in SQLite via matrix-sdk-sqlite; access tokens remain in `pan.db`
+
+### Added
+- `recover-identity` panctl command: restore cross-signing keys from SSSS security key or passphrase
+- `send-anyways` / `cancel-sending` panctl commands to resolve blocked sends interactively
+- `continue-keyshare` / `cancel-keyshare` panctl commands (key forwarding to verified devices is automatic)
+- `DropOldKeys` config option: prune duplicate inbound Megolm sessions on startup
+- Cross-signing trust recognised in unverified-device check — devices verified via another client's cross-signing flow no longer block sends
+- `IgnoreVerification` config option now correctly bypasses the unverified-device check
+- `list-devices` output distinguishes `cross-signing-verified` from `unset`
+- Dockerfile uses BuildKit cache mounts for fast incremental rebuilds; upgraded to Debian trixie
+
+---
+
 ## 0.10.5 2022-09-28
 
 ### Added
