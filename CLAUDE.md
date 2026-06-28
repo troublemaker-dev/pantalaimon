@@ -4,103 +4,154 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What This Is
 
-Pantalaimon is an E2E encryption-aware Matrix reverse proxy daemon. It sits between Matrix clients and a homeserver, transparently encrypting outgoing messages and decrypting incoming ones. Clients connect to pantalaimon as if it were the homeserver; pantalaimon handles all crypto via `matrix-nio[e2e]`, which requires the `libolm` C library (>= 3.1) to be installed.
+Pantalaimon is an E2E encryption-aware Matrix reverse proxy daemon written in Rust. It sits between Matrix clients and a homeserver, transparently encrypting outgoing messages and decrypting incoming ones. Crypto is handled by [Vodozemac](https://github.com/matrix-org/vodozemac) via `matrix-sdk-crypto`. No libolm or Python dependency.
 
 ## Commands
 
 ```bash
-# Install (requires libolm system library)
-pip install .[ui]
+# Build (with D-Bus/panctl support)
+cargo build --features ui
+
+# Build without D-Bus (no panctl, works on macOS natively)
+cargo build
+
+# Run pantalaimon
+cargo run --bin pantalaimon --features ui -- -c ~/.config/pantalaimon/pantalaimon.conf --data-path ~/.local/share/pantalaimon
+
+# Run panctl (requires D-Bus, Linux only)
+cargo run --bin panctl --features ui --
 
 # Run tests
-python3 -m pytest
+cargo test
 
-# Run a single test file or test
-python3 -m pytest tests/proxy_test.py
-python3 -m pytest tests/proxy_test.py::TestClass::test_name
-
-# Lint and style checks
-python3 -m pytest --flake8 pantalaimon
-python3 -m pytest --black pantalaimon
-
-# Type check
-mypy --ignore-missing-imports pantalaimon
-
-# Coverage
-python3 -m pytest --cov=pantalaimon --cov-report term-missing
-
-# Format
-black pantalaimon/
-isort -y -p pantalaimon
-
-# Run locally
-python -m pantalaimon.main --log-level debug --config ./contrib/pantalaimon.conf
+# Run a specific test
+cargo test test_name
 ```
 
-## Docker
+## Container
 
-The image includes the `[ui]` extras (`pydbus`, `PyGObject`, `dbus-python`) so that `panctl` works inside the container. Because those packages make `UI_ENABLED = True`, the daemon requires a D-Bus session bus. `entrypoint.sh` starts `dbus-daemon` at a fixed socket path before exec-ing `pantalaimon`, and `DBUS_SESSION_BUS_ADDRESS` is baked into the image so any exec'd process (including `panctl`) finds the bus automatically.
+D-Bus is Linux-only; the container is required on macOS to use panctl.
 
 ```bash
-# Build
-docker build -t pantalaimon .
+# Build image
+podman build -t pantalaimon .
 
-# Run (create pantalaimon.conf first; UseKeyring = False required in containers)
-docker run -it --rm -v /path/to/data:/data -p 8008:8008 pantalaimon
+# Run
+podman run -it --rm \
+  --name pantalaimon \
+  -v ~/.local/share/pantalaimon:/data \
+  -v ~/.config/pantalaimon:/config \
+  --publish 8009:8009 \
+  -e RUST_LOG=pantalaimon=debug \
+  pantalaimon \
+  -c /config/pantalaimon.conf --data-path /data
 
-# Use panctl inside a running container
-docker exec -it <container> panctl
+# Use panctl inside the running container
+podman exec -it pantalaimon panctl <command>
 ```
 
-The builder stage requires `libdbus-1-dev libglib2.0-dev libgirepository-2.0-dev libcairo2-dev` to compile the UI Python extensions. The runtime stage requires `libgirepository-2.0-0 gir1.2-glib-2.0 libdbus-1-3 dbus`.
+`entrypoint.sh` starts `dbus-daemon` at a fixed socket path before exec-ing `pantalaimon`. `DBUS_SESSION_BUS_ADDRESS` is baked into the image. The Dockerfile uses BuildKit cache mounts for the cargo registry and `target/` directory; subsequent builds only recompile changed crates.
+
+## Crate layout
+
+```
+crates/
+  pantalaimon/   — daemon binary + library
+    src/
+      main.rs       — startup, channel wiring, message_router task
+      config.rs     — INI config parser (PanConfig, ServerConfig)
+      client.rs     — PanClient: crypto, sync processing, SAS verification
+      proxy/
+        daemon.rs   — ProxyDaemon: per-server state, client registry
+        routes.rs   — axum route handlers
+        mod.rs
+      dbus/
+        server.rs   — DbusServer: zbus ControlIface + DevicesIface
+        mod.rs
+      messages.rs   — DaemonToUi / UiToDaemon enums
+      store.rs      — PanStore: SQLite via sqlx (tokens, media keys)
+      error.rs      — AppError
+      lib.rs
+  panctl/        — panctl binary (clap CLI + zbus client)
+```
 
 ## Architecture
-
-### Threading model
-
-The daemon runs on a single asyncio event loop. When the optional D-Bus UI is enabled (`ui.py`, requires `gi`/`pydbus`), it runs in a separate thread via `GlibT`. The two sides communicate through a pair of `janus.Queue` instances (which bridge sync and async): `pan_queue` carries messages from the UI thread to the daemon, `ui_queue` carries signals from the daemon to the UI thread. The `message_router` coroutine in `main.py` dispatches incoming UI messages to the correct `ProxyDaemon` instance.
 
 ### Request flow
 
 ```
-Matrix client → ProxyDaemon (aiohttp, daemon.py)
+Matrix client → axum (ProxyDaemon, proxy/routes.rs)
                     ↓ intercepts select routes
-                PanClient (client.py, matrix-nio AsyncClient)
-                    ↓ background sync loop
+                PanClient (client.rs, matrix-sdk-crypto OlmMachine)
+                    ↓ no independent sync loop — driven by client syncs
                 Matrix homeserver
 ```
 
-`ProxyDaemon` (`daemon.py`) handles all HTTP requests. It maintains one `PanClient` per logged-in user in `pan_clients`. Most requests are forwarded directly to the homeserver; the proxy intercepts:
-- `login` — starts a `PanClient` background sync loop for the user
-- `sync` — decrypts encrypted events in the response before returning them
-- `rooms/{room_id}/messages` — same decryption treatment for paginated history
-- `rooms/{room_id}/send` — encrypts outgoing messages for encrypted rooms; holds the request if there are unverified devices and signals the UI thread
-- `media/upload` — encrypts uploaded files and stores encryption keys
-- `media/download` — fetches and decrypts previously encrypted files
-- `search` — optionally handled locally by the tantivy index (currently disabled)
+`ProxyDaemon` handles all HTTP. It maintains one `PanClient` per logged-in user in `pan_clients`, looked up by access token via `token_to_user`. Intercepted routes:
 
-### Key components
+- `POST /login` — creates `PanClient`, stores token
+- `GET /sync` — initial sync is proxy-passed; subsequent syncs call `process_sync` then `run_post_sync_tasks` in a spawned task
+- `GET /rooms/{id}/messages` — decrypts paginated history
+- `PUT /rooms/{id}/send/{type}/{txn}` — encrypts outgoing events; blocks if unverified devices (unless `IgnoreVerification = True`)
+- `POST /media/upload` — encrypts attachment, stores keys
+- `GET /media/download/{server}/{id}` — fetches and decrypts attachment
 
-- **`daemon.py` — `ProxyDaemon`**: The aiohttp request handler. Owns the per-user `PanClient` map. Sends/receives `thread_messages` to communicate with the UI. Handles the unverified-devices flow (semaphore + decision queue per room).
+### PanClient
 
-- **`client.py` — `PanClient`**: Subclass of `nio.AsyncClient`. Runs a continuous background sync loop. Handles SAS key verification, key request forwarding, and optional room history indexing. The `synced` asyncio `Event` is used in `daemon.py` to wait for a new sync when decryption fails.
+`OlmMachine` is Arc-backed and internally synchronised; no external Mutex needed. `PanClient` itself is wrapped in `Arc<PanClient>` in the daemon.
 
-- **`store.py` — `PanStore`**: SQLite-backed persistence via peewee. Stores which users belong to which server, access tokens (when keyring is disabled), and encrypted media metadata (`MediaInfo`, `UploadInfo`). `KeyDroppingSqliteStore` is a nio store subclass that drops old Megolm sessions.
+**Sync processing** (`process_sync`):
+1. Extract to-device events, device lists, OTK counts from sync body
+2. `olm.receive_sync_changes()` — feeds crypto state machine
+3. Track rooms gaining `m.room.encryption` state events
+4. Decrypt `m.room.encrypted` timeline events in-place
+5. `check_incoming_verifications()` — scan to-device events for `m.key.verification.request`, emit `SasInvite`
 
-- **`thread_messages.py`**: All inter-thread messages are attrs classes. The daemon sends `UnverifiedDevicesSignal`, `InviteSasSignal`, `ShowSasSignal`, `SasDoneSignal`, `DaemonResponse`, and `UpdateUsersMessage`/`UpdateDevicesMessage` to the UI. The UI sends device management and key operation commands back.
+**Post-sync tasks** (`run_post_sync_tasks`, spawned so sync response returns immediately):
+- `process_outgoing_requests()` — flush OlmMachine outgoing requests (keys/upload, keys/query, keys/claim, to-device, signature upload, room message)
+- `check_pending_requests()` — for outgoing SAS flows, call `start_sas()` once remote accepts
+- `check_sas_states()` — emit `SasShow` (emoji ready) and `SasDone` (done/cancelled); cleans up `active_sas`, `notified_show`, `notified_done`, `notified_invite` on flow end
 
-- **`ui.py` — `GlibT`**: The optional D-Bus interface, exposed on the session bus so `panctl` can control the daemon. UI is enabled only when `gi`, `gi.repository`, and `pydbus` are all importable.
+**Unverified device check** uses `device.is_verified()` which covers both manual `LocalTrust::Verified` and cross-signing trust. Skips `self.user_id`. Blocked sends wait up to 30 seconds for a `SendAnyways` or `CancelSending` command from panctl.
 
-- **`panctl.py`**: Interactive prompt_toolkit REPL that issues commands over D-Bus. Entry point: `panctl`.
+### D-Bus / panctl
 
-- **`index.py`**: Full-text search via `tantivy`. Currently **always disabled** — the `INDEXING_ENABLED = True` assignment is inside an `if False:` block, so `INDEXING_ENABLED` is always `False`.
+Two zbus interfaces at `/org/pantalaimon1`:
+- `org.pantalaimon1.control` — verification flows, key import/export, identity recovery, send decisions
+- `org.pantalaimon1.devices` — list/verify/blacklist devices
 
-- **`config.py`**: INI-style config (`configparser`) with a `[Default]` section and per-server sections. Default listen address is `localhost:8009`.
+panctl is a one-shot subcommand CLI (not an interactive REPL). Each invocation connects to D-Bus, sends a command, waits for the response signal, and exits.
 
-### Access token handling
+Signal flow: `DaemonToUi` messages are sent over an `mpsc` channel to `DbusServer`, which emits zbus signals. `UiToDaemon` commands arrive as D-Bus method calls and are routed by `message_router` in `main.rs` to the correct `PanClient`.
 
-On login the proxy captures the homeserver's response, stores the access token either in the OS keyring (`keyring` library) or in SQLite (if `UseKeyring = False`). Subsequent requests from any client using a valid token are resolved to the owning `PanClient` via `_find_client`, which calls `/_matrix/client/r0/whoami` on first sight and caches the result.
+### Config
 
-### Media encryption
+INI format, `[Default]` section + one section per server. Key options:
 
-Uploaded files are encrypted by `PanClient.upload` and the encryption keys (`key`, `iv`, `hashes`) are stored in `PanStore`. On download, `ProxyDaemon._load_decrypted_file` retrieves keys, downloads the ciphertext, and decrypts in a `ProcessPoolExecutor` (to avoid blocking the event loop).
+| Key | Default | Notes |
+|-----|---------|-------|
+| `LogLevel` | `Warning` | Error/Warning/Info/Debug |
+| `Homeserver` | required | Upstream homeserver URL |
+| `ListenAddress` | `localhost` | Use `0.0.0.0` in containers |
+| `ListenPort` | `8009` | |
+| `UseSSL` / `SSL` | `True` | Whether upstream uses HTTPS |
+| `UseKeyring` | `True` | Set `False` in containers |
+| `IgnoreVerification` | `False` | Skip unverified-device check |
+| `DropOldKeys` | `False` | Prune duplicate Megolm sessions on startup |
+
+### Store
+
+`PanStore` uses sqlx + SQLite. Tables:
+- `pan_server_user` — which users belong to which server
+- `pan_access_token` — tokens when `UseKeyring = False`
+- `pan_media_info` — media encryption keys keyed by `(server, mxc_server, mxc_path)`
+- `pan_upload_info` — filename + mimetype for uploaded media
+- `schema_version` — migration tracking
+
+Crypto state (Olm/Megolm sessions, device keys, verification state) is stored separately per user in `matrix-sdk-sqlite` (`SqliteCryptoStore`) under `<data_dir>/crypto-<user>_<device>/`.
+
+### Known limitations
+
+- No independent sync loop — pantalaimon's OlmMachine is only updated when a client syncs through it. Verification requests from other clients won't be visible until the proxied client syncs.
+- panctl is not interactive (no REPL); each command is a separate invocation.
+- Blocked-send notifications require panctl to be running and watching; there are no OS notifications.
