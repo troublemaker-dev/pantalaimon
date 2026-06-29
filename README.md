@@ -1,6 +1,9 @@
 pantalaimon
 ===========
 
+**Retirement Alert**: This repository was rewritten in Rust and moved over to [pantalaimon-rs](https://github.com/troublemaker-dev/pantalaimon-rs)
+
+
 Pantalaimon is an end-to-end encryption aware Matrix reverse proxy daemon.
 Pantalaimon acts as a good man in the middle that handles the encryption for you.
 
